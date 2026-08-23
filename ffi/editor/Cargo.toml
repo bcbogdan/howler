@@ -1,0 +1,14 @@
+[package]
+name = "howler-editor-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+howler-editor = { path = "../../core/crates/howler-editor" }
+libc.workspace = true
+serde_json.workspace = true

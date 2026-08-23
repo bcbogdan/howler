@@ -1,0 +1,8 @@
+/target
+/.build
+DerivedData/
+*.xcuserstate
+xcuserdata/
+*.sqlite3-shm
+*.sqlite3-wal
+.DS_Store

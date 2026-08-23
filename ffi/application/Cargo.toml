@@ -1,0 +1,19 @@
+[package]
+name = "howler-application-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+howler-app = { path = "../../core/crates/howler-app" }
+howler-editor = { path = "../../core/crates/howler-editor" }
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,0 +1,17 @@
+[package]
+name = "howler-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "howler"
+path = "src/main.rs"
+
+[dependencies]
+howler-app = { path = "../../core/crates/howler-app" }
+howler-editor = { path = "../../core/crates/howler-editor" }
+howler-application-ffi = { path = "../../ffi/application" }
+howler-editor-ffi = { path = "../../ffi/editor" }
+serde_json.workspace = true

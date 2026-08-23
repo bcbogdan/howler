@@ -1,0 +1,29 @@
+[workspace]
+resolver = "2"
+members = [
+  "core/crates/howler-editor",
+  "core/crates/howler-app",
+  "ffi/editor",
+  "ffi/application",
+  "apps/cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.80"
+
+[workspace.dependencies]
+blake3 = "1.5"
+libc = "0.2"
+pulldown-cmark = "0.12"
+ropey = "1.6"
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+tempfile = "3"
+thiserror = "2"
+ulid = "1"
+walkdir = "2"
