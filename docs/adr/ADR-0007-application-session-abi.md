@@ -28,6 +28,6 @@ Provider file coordination is not implemented. ABI v2 therefore does not expose 
 
 Cancellable rescan/rebuild, external-change event ingestion, event polling, background progress, split-lock immutable queries, and multi-session adoption quiescing remain deferred. Synchronous rescan/rebuild remain available only through the legacy v1/core APIs and are intentionally not exported as v2 session operations.
 
-The Swift package imports the C header and contains typed v2 response/session wrappers, but `AppModel` still uses v1 during migration. Queued `BUSY` retry, guarded native-input replay, native effect execution, and complete AppModel migration remain required before the macOS host can claim the final thin-host architecture.
+The Swift package imports the C header and `AppModel` uses one MainActor-owned v2 session with typed responses, queued native-input `BUSY` retry, pending-native-draft handoff and resolution, and identified autosave execution. The macOS host exposes active-note reconciliation only; it does not claim full-folder rescan/rebuild until the deferred cancellable task API exists. Guarded IME replay remains incomplete, so marked text blocks save and editor replacement instead of claiming replay support.
 
 Milestone 2 task, reminder, notification, and time-zone domains are not part of this ABI until their Rust domain model exists.
