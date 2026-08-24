@@ -3,15 +3,16 @@
 //! free calls. Unsafe code is confined to pointer conversion and allocator ownership transfer.
 #![allow(unsafe_code, clippy::missing_safety_doc)]
 
-use howler_app::{AppError, NoteEditor, NoteFolder};
+use howler_app::{AppError, ApplicationSession, NoteEditor, NoteFolder};
 use howler_editor::{EditorCommand, EditorError, Transaction};
 use libc::c_char;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::ffi::{CStr, CString};
 use std::ptr;
 use std::sync::{Mutex, TryLockError};
 
 pub const ABI_VERSION: u32 = 1;
+pub const SESSION_ABI_VERSION: u32 = 2;
 pub const OK: i32 = 0;
 pub const INVALID_ARGUMENT: i32 = 1;
 pub const STALE_REVISION: i32 = 2;
@@ -34,9 +35,422 @@ pub struct HowlerNoteEditor {
     inner: Mutex<NoteEditor>,
 }
 
+pub struct HowlerApplicationSession {
+    inner: Mutex<ApplicationSession>,
+}
+
+#[derive(Serialize)]
+struct BoundaryProblem<'a> {
+    code: &'a str,
+    diagnostic: &'a str,
+}
+
 #[no_mangle]
 pub extern "C" fn howler_application_abi_version() -> u32 {
     ABI_VERSION
+}
+
+#[no_mangle]
+pub extern "C" fn howler_session_abi_version() -> u32 {
+    SESSION_ABI_VERSION
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn howler_session_create(
+    out_session: *mut *mut HowlerApplicationSession,
+) -> i32 {
+    if !init_handle_out(out_session) {
+        return INVALID_ARGUMENT;
+    }
+    unsafe {
+        *out_session = Box::into_raw(Box::new(HowlerApplicationSession {
+            inner: Mutex::new(ApplicationSession::default()),
+        }));
+    }
+    OK
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn howler_session_destroy(session: *mut HowlerApplicationSession) {
+    if !session.is_null() {
+        drop(unsafe { Box::from_raw(session) });
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn howler_session_state_json(
+    session: *mut HowlerApplicationSession,
+    out_response_json: *mut *mut c_char,
+    out_boundary_problem_json: *mut *mut c_char,
+) -> i32 {
+    session_output(
+        session,
+        out_response_json,
+        out_boundary_problem_json,
+        |session| session.inspect(),
+    )
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn howler_session_connect_json(
+    session: *mut HowlerApplicationSession,
+    request_json: *const c_char,
+    out_response_json: *mut *mut c_char,
+    out_boundary_problem_json: *mut *mut c_char,
+) -> i32 {
+    session_input(
+        session,
+        request_json,
+        out_response_json,
+        out_boundary_problem_json,
+        ApplicationSession::connect,
+    )
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn howler_session_adopt_folder_json(
+    session: *mut HowlerApplicationSession,
+    out_response_json: *mut *mut c_char,
+    out_boundary_problem_json: *mut *mut c_char,
+) -> i32 {
+    session_output(
+        session,
+        out_response_json,
+        out_boundary_problem_json,
+        |session| session.adopt_folder(),
+    )
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn howler_session_create_note_json(
+    session: *mut HowlerApplicationSession,
+    request_json: *const c_char,
+    out_response_json: *mut *mut c_char,
+    out_boundary_problem_json: *mut *mut c_char,
+) -> i32 {
+    session_input(
+        session,
+        request_json,
+        out_response_json,
+        out_boundary_problem_json,
+        ApplicationSession::create_note,
+    )
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn howler_session_open_note_json(
+    session: *mut HowlerApplicationSession,
+    note_id: *const c_char,
+    out_response_json: *mut *mut c_char,
+    out_boundary_problem_json: *mut *mut c_char,
+) -> i32 {
+    session_string_input(
+        session,
+        note_id,
+        out_response_json,
+        out_boundary_problem_json,
+        ApplicationSession::open_note,
+    )
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn howler_session_close_note_json(
+    session: *mut HowlerApplicationSession,
+    out_response_json: *mut *mut c_char,
+    out_boundary_problem_json: *mut *mut c_char,
+) -> i32 {
+    session_output(
+        session,
+        out_response_json,
+        out_boundary_problem_json,
+        |session| session.close_note(),
+    )
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn howler_session_apply_text_edit_json(
+    session: *mut HowlerApplicationSession,
+    edit_json: *const c_char,
+    out_response_json: *mut *mut c_char,
+    out_boundary_problem_json: *mut *mut c_char,
+) -> i32 {
+    session_input(
+        session,
+        edit_json,
+        out_response_json,
+        out_boundary_problem_json,
+        ApplicationSession::apply_text_edit,
+    )
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn howler_session_preserve_pending_native_draft_json(
+    session: *mut HowlerApplicationSession,
+    draft_json: *const c_char,
+    out_response_json: *mut *mut c_char,
+    out_boundary_problem_json: *mut *mut c_char,
+) -> i32 {
+    session_input(
+        session,
+        draft_json,
+        out_response_json,
+        out_boundary_problem_json,
+        ApplicationSession::preserve_pending_native_draft,
+    )
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn howler_session_resolve_pending_native_draft_json(
+    session: *mut HowlerApplicationSession,
+    resolution_json: *const c_char,
+    out_response_json: *mut *mut c_char,
+    out_boundary_problem_json: *mut *mut c_char,
+) -> i32 {
+    session_input(
+        session,
+        resolution_json,
+        out_response_json,
+        out_boundary_problem_json,
+        ApplicationSession::resolve_pending_native_draft,
+    )
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn howler_session_execute_command_json(
+    session: *mut HowlerApplicationSession,
+    expected_revision: u64,
+    command_json: *const c_char,
+    out_response_json: *mut *mut c_char,
+    out_boundary_problem_json: *mut *mut c_char,
+) -> i32 {
+    session_input(
+        session,
+        command_json,
+        out_response_json,
+        out_boundary_problem_json,
+        |session, command| session.execute_command(expected_revision, command),
+    )
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn howler_session_undo_json(
+    session: *mut HowlerApplicationSession,
+    expected_revision: u64,
+    out_response_json: *mut *mut c_char,
+    out_boundary_problem_json: *mut *mut c_char,
+) -> i32 {
+    session_output(
+        session,
+        out_response_json,
+        out_boundary_problem_json,
+        |session| session.undo(expected_revision),
+    )
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn howler_session_redo_json(
+    session: *mut HowlerApplicationSession,
+    expected_revision: u64,
+    out_response_json: *mut *mut c_char,
+    out_boundary_problem_json: *mut *mut c_char,
+) -> i32 {
+    session_output(
+        session,
+        out_response_json,
+        out_boundary_problem_json,
+        |session| session.redo(expected_revision),
+    )
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn howler_session_save_json(
+    session: *mut HowlerApplicationSession,
+    target_json: *const c_char,
+    out_response_json: *mut *mut c_char,
+    out_boundary_problem_json: *mut *mut c_char,
+) -> i32 {
+    session_input(
+        session,
+        target_json,
+        out_response_json,
+        out_boundary_problem_json,
+        ApplicationSession::save,
+    )
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn howler_session_resolve_conflict_json(
+    session: *mut HowlerApplicationSession,
+    resolution_json: *const c_char,
+    out_response_json: *mut *mut c_char,
+    out_boundary_problem_json: *mut *mut c_char,
+) -> i32 {
+    session_input(
+        session,
+        resolution_json,
+        out_response_json,
+        out_boundary_problem_json,
+        ApplicationSession::resolve_conflict,
+    )
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn howler_session_restore_recovery_json(
+    session: *mut HowlerApplicationSession,
+    note_id: *const c_char,
+    out_response_json: *mut *mut c_char,
+    out_boundary_problem_json: *mut *mut c_char,
+) -> i32 {
+    session_string_input(
+        session,
+        note_id,
+        out_response_json,
+        out_boundary_problem_json,
+        ApplicationSession::restore_recovery,
+    )
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn howler_session_discard_recovery_json(
+    session: *mut HowlerApplicationSession,
+    note_id: *const c_char,
+    out_response_json: *mut *mut c_char,
+    out_boundary_problem_json: *mut *mut c_char,
+) -> i32 {
+    session_string_input(
+        session,
+        note_id,
+        out_response_json,
+        out_boundary_problem_json,
+        ApplicationSession::discard_recovery,
+    )
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn howler_session_reconcile_active_json(
+    session: *mut HowlerApplicationSession,
+    out_response_json: *mut *mut c_char,
+    out_boundary_problem_json: *mut *mut c_char,
+) -> i32 {
+    session_output(
+        session,
+        out_response_json,
+        out_boundary_problem_json,
+        |session| session.reconcile_active(),
+    )
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn howler_session_search_json(
+    session: *mut HowlerApplicationSession,
+    query_json: *const c_char,
+    out_response_json: *mut *mut c_char,
+    out_boundary_problem_json: *mut *mut c_char,
+) -> i32 {
+    session_input(
+        session,
+        query_json,
+        out_response_json,
+        out_boundary_problem_json,
+        |session, query| session.search(query),
+    )
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn howler_session_rename_note_json(
+    session: *mut HowlerApplicationSession,
+    request_json: *const c_char,
+    out_response_json: *mut *mut c_char,
+    out_boundary_problem_json: *mut *mut c_char,
+) -> i32 {
+    session_input(
+        session,
+        request_json,
+        out_response_json,
+        out_boundary_problem_json,
+        ApplicationSession::rename_note,
+    )
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn howler_session_move_note_json(
+    session: *mut HowlerApplicationSession,
+    request_json: *const c_char,
+    out_response_json: *mut *mut c_char,
+    out_boundary_problem_json: *mut *mut c_char,
+) -> i32 {
+    session_input(
+        session,
+        request_json,
+        out_response_json,
+        out_boundary_problem_json,
+        ApplicationSession::move_note,
+    )
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn howler_session_trash_note_json(
+    session: *mut HowlerApplicationSession,
+    note_id: *const c_char,
+    out_response_json: *mut *mut c_char,
+    out_boundary_problem_json: *mut *mut c_char,
+) -> i32 {
+    session_string_input(
+        session,
+        note_id,
+        out_response_json,
+        out_boundary_problem_json,
+        ApplicationSession::trash_note,
+    )
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn howler_session_restore_note_json(
+    session: *mut HowlerApplicationSession,
+    request_json: *const c_char,
+    out_response_json: *mut *mut c_char,
+    out_boundary_problem_json: *mut *mut c_char,
+) -> i32 {
+    session_input(
+        session,
+        request_json,
+        out_response_json,
+        out_boundary_problem_json,
+        ApplicationSession::restore_note,
+    )
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn howler_session_diagnostics_json(
+    session: *mut HowlerApplicationSession,
+    out_response_json: *mut *mut c_char,
+    out_boundary_problem_json: *mut *mut c_char,
+) -> i32 {
+    session_output(
+        session,
+        out_response_json,
+        out_boundary_problem_json,
+        |session| session.diagnostics(),
+    )
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn howler_session_diagnostic_bundle_json(
+    session: *mut HowlerApplicationSession,
+    out_response_json: *mut *mut c_char,
+    out_boundary_problem_json: *mut *mut c_char,
+) -> i32 {
+    session_output(
+        session,
+        out_response_json,
+        out_boundary_problem_json,
+        |session| session.diagnostic_bundle(),
+    )
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn howler_session_string_free(string: *mut c_char) {
+    unsafe { howler_application_string_free(string) }
 }
 
 #[no_mangle]
@@ -468,6 +882,150 @@ pub unsafe extern "C" fn howler_folder_diagnostic_bundle(
     folder_json(folder, out_json, NoteFolder::diagnostic_bundle)
 }
 
+unsafe fn session_input<I, O>(
+    session: *mut HowlerApplicationSession,
+    input_json: *const c_char,
+    out_response_json: *mut *mut c_char,
+    out_boundary_problem_json: *mut *mut c_char,
+    operation: impl FnOnce(&mut ApplicationSession, I) -> O,
+) -> i32
+where
+    I: for<'de> Deserialize<'de>,
+    O: Serialize,
+{
+    if !init_session_outputs(out_response_json, out_boundary_problem_json) {
+        return INVALID_ARGUMENT;
+    }
+    let input = match cstr(input_json) {
+        Ok(json) => match serde_json::from_str(json) {
+            Ok(input) => input,
+            Err(error) => {
+                return boundary_failure(
+                    out_boundary_problem_json,
+                    INVALID_ARGUMENT,
+                    "malformed_json",
+                    &error.to_string(),
+                )
+            }
+        },
+        Err(_) => {
+            return boundary_failure(
+                out_boundary_problem_json,
+                INVALID_ARGUMENT,
+                "invalid_utf8",
+                "input must be non-null NUL-terminated UTF-8",
+            )
+        }
+    };
+    with_session_output(
+        session,
+        out_response_json,
+        out_boundary_problem_json,
+        |session| operation(session, input),
+    )
+}
+
+unsafe fn session_string_input<O>(
+    session: *mut HowlerApplicationSession,
+    input: *const c_char,
+    out_response_json: *mut *mut c_char,
+    out_boundary_problem_json: *mut *mut c_char,
+    operation: impl FnOnce(&mut ApplicationSession, &str) -> O,
+) -> i32
+where
+    O: Serialize,
+{
+    if !init_session_outputs(out_response_json, out_boundary_problem_json) {
+        return INVALID_ARGUMENT;
+    }
+    let input = match cstr(input) {
+        Ok(input) => input,
+        Err(_) => {
+            return boundary_failure(
+                out_boundary_problem_json,
+                INVALID_ARGUMENT,
+                "invalid_utf8",
+                "input must be non-null NUL-terminated UTF-8",
+            )
+        }
+    };
+    with_session_output(
+        session,
+        out_response_json,
+        out_boundary_problem_json,
+        |session| operation(session, input),
+    )
+}
+
+unsafe fn session_output<O>(
+    session: *mut HowlerApplicationSession,
+    out_response_json: *mut *mut c_char,
+    out_boundary_problem_json: *mut *mut c_char,
+    operation: impl FnOnce(&mut ApplicationSession) -> O,
+) -> i32
+where
+    O: Serialize,
+{
+    if !init_session_outputs(out_response_json, out_boundary_problem_json) {
+        return INVALID_ARGUMENT;
+    }
+    with_session_output(
+        session,
+        out_response_json,
+        out_boundary_problem_json,
+        operation,
+    )
+}
+
+fn with_session_output<O: Serialize>(
+    session: *mut HowlerApplicationSession,
+    out_response_json: *mut *mut c_char,
+    out_boundary_problem_json: *mut *mut c_char,
+    operation: impl FnOnce(&mut ApplicationSession) -> O,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_ref() }) else {
+        return boundary_failure(
+            out_boundary_problem_json,
+            INVALID_ARGUMENT,
+            "invalid_handle",
+            "session handle is null",
+        );
+    };
+    let mut session = match try_lock(&session.inner) {
+        Ok(session) => session,
+        Err(BUSY) => {
+            return boundary_failure(
+                out_boundary_problem_json,
+                BUSY,
+                "busy",
+                "session is in use by another call",
+            )
+        }
+        Err(_) => {
+            return boundary_failure(
+                out_boundary_problem_json,
+                INTERNAL,
+                "poisoned_handle",
+                "session lock is unavailable",
+            )
+        }
+    };
+    output_value_initialized(out_response_json, &operation(&mut session))
+}
+
+fn init_session_outputs(response: *mut *mut c_char, boundary: *mut *mut c_char) -> bool {
+    let response_valid = init_string_out(response);
+    let boundary_valid = init_string_out(boundary);
+    response_valid && boundary_valid
+}
+
+fn boundary_failure(out: *mut *mut c_char, status: i32, code: &str, diagnostic: &str) -> i32 {
+    if !out.is_null() {
+        let _ = output_value_initialized(out, &BoundaryProblem { code, diagnostic });
+    }
+    status
+}
+
 unsafe fn folder_json<T: Serialize>(
     folder: *mut HowlerNoteFolder,
     out_json: *mut *mut c_char,
@@ -569,6 +1127,7 @@ fn app_error(error: &AppError) -> i32 {
         AppError::RecoveryPending(_) | AppError::IdentityChanged | AppError::StaleHandle => {
             CONFLICT
         }
+        AppError::NoteAlreadyOpen(_) | AppError::PendingNativeDraft(_) => CONFLICT,
         AppError::ExternalConflict { .. } => CONFLICT,
         AppError::Io(_) | AppError::InvalidUtf8(_) => IO,
         AppError::WrongOwner => WRONG_OWNER,
@@ -741,5 +1300,197 @@ mod tests {
             howler_application_string_free(json);
             howler_folder_destroy(folder);
         }
+    }
+
+    unsafe fn create_session() -> *mut HowlerApplicationSession {
+        let mut session = ptr::null_mut();
+        assert_eq!(unsafe { howler_session_create(&mut session) }, OK);
+        session
+    }
+
+    unsafe fn connect_session(session: *mut HowlerApplicationSession, notes: &Path, state: &Path) {
+        let request = CString::new(
+            serde_json::json!({
+                "folder_path": notes,
+                "application_state_path": state,
+                "adopt": false,
+                "create_missing": false
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut response = ptr::null_mut();
+        let mut boundary = ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                howler_session_connect_json(session, request.as_ptr(), &mut response, &mut boundary)
+            },
+            OK
+        );
+        assert!(boundary.is_null());
+        assert!(unsafe { CStr::from_ptr(response) }
+            .to_str()
+            .unwrap()
+            .contains("\"status\":\"applied\""));
+        unsafe { howler_session_string_free(response) };
+    }
+
+    #[test]
+    fn session_abi_returns_applied_and_structured_rejected_responses() {
+        let notes = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        unsafe {
+            let session = create_session();
+            connect_session(session, notes.path(), state.path());
+            let mut response = ptr::null_mut();
+            let mut boundary = ptr::null_mut();
+            assert_eq!(
+                howler_session_state_json(session, &mut response, &mut boundary),
+                OK
+            );
+            let state_json = CStr::from_ptr(response).to_str().unwrap();
+            assert!(state_json.contains("\"status\":\"applied\""));
+            assert!(state_json.contains("\"state\":{"));
+            howler_session_string_free(response);
+            let edit = CString::new(
+                r#"{"expected_revision":8,"replacements":[],"selections":[],"history":"Isolated","composition":null}"#,
+            )
+            .unwrap();
+            response = ptr::null_mut();
+            boundary = ptr::null_mut();
+            assert_eq!(
+                howler_session_apply_text_edit_json(
+                    session,
+                    edit.as_ptr(),
+                    &mut response,
+                    &mut boundary,
+                ),
+                OK
+            );
+            assert!(boundary.is_null());
+            let json = CStr::from_ptr(response).to_str().unwrap();
+            assert!(json.contains("\"status\":\"rejected\""));
+            assert!(json.contains("\"code\":\"stale_revision\""));
+            assert!(json.contains("\"current_revision\":0"));
+            assert!(json.contains("\"state\":{"));
+            howler_session_string_free(response);
+            howler_session_destroy(session);
+        }
+    }
+
+    #[test]
+    fn session_abi_boundary_failures_initialize_outputs_and_report_busy() {
+        unsafe {
+            let session = create_session();
+            let invalid = CString::new("not json").unwrap();
+            let mut response = 1usize as *mut c_char;
+            let mut boundary = 1usize as *mut c_char;
+            assert_eq!(
+                howler_session_connect_json(
+                    session,
+                    invalid.as_ptr(),
+                    &mut response,
+                    &mut boundary,
+                ),
+                INVALID_ARGUMENT
+            );
+            assert!(response.is_null());
+            assert!(CStr::from_ptr(boundary)
+                .to_str()
+                .unwrap()
+                .contains("malformed_json"));
+            howler_session_string_free(boundary);
+
+            let _guard = (*session).inner.lock().unwrap();
+            boundary = ptr::null_mut();
+            assert_eq!(
+                howler_session_state_json(session, &mut response, &mut boundary),
+                BUSY
+            );
+            assert!(response.is_null());
+            assert!(CStr::from_ptr(boundary).to_str().unwrap().contains("busy"));
+            howler_session_string_free(boundary);
+            drop(_guard);
+            howler_session_destroy(session);
+        }
+    }
+
+    #[test]
+    fn v1_v2_versions_are_stable() {
+        assert_eq!(howler_application_abi_version(), 1);
+        assert_eq!(howler_session_abi_version(), 2);
+    }
+
+    #[test]
+    fn checked_in_v2_json_schema_is_valid_and_covers_exported_requests() {
+        let schema: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../docs/schema/application-session-v2.schema.json"
+        ))
+        .unwrap();
+        assert_eq!(
+            schema["$id"],
+            "https://howler.local/schema/application-session-v2.schema.json"
+        );
+        assert_eq!(schema["$ref"], "#/$defs/applicationResponse");
+        let definitions = schema["$defs"].as_object().unwrap();
+        for required in [
+            "applicationResponse",
+            "appliedValue",
+            "applicationState",
+            "problem",
+            "hostEffect",
+            "connectRequest",
+            "createNoteRequest",
+            "hostTextEdit",
+            "editorCommand",
+            "pendingNativeDraft",
+            "pendingDraftResolution",
+            "saveTarget",
+            "conflictResolution",
+            "searchQuery",
+            "renameNoteRequest",
+            "moveNoteRequest",
+            "restoreNoteRequest",
+            "noteSummary",
+            "noteResult",
+            "editResult",
+            "saveResult",
+            "reconcileResult",
+            "searchResult",
+            "diagnostic",
+            "diagnosticBundle",
+        ] {
+            assert!(
+                definitions.contains_key(required),
+                "missing schema {required}"
+            );
+        }
+        assert_eq!(
+            definitions["applicationResponse"]["properties"]["outcome"]["oneOf"][0]["properties"]
+                ["value"]["$ref"],
+            "#/$defs/appliedValue"
+        );
+        for resolution in ["pendingDraftResolution", "conflictResolution"] {
+            let required = definitions[resolution]["oneOf"][0]["required"]
+                .as_array()
+                .unwrap();
+            assert!(!required.iter().any(|field| field == "title"));
+        }
+        fn assert_extensible(value: &serde_json::Value) {
+            if let Some(object) = value.as_object() {
+                assert_ne!(
+                    object.get("additionalProperties"),
+                    Some(&serde_json::Value::Bool(false))
+                );
+                for child in object.values() {
+                    assert_extensible(child);
+                }
+            } else if let Some(array) = value.as_array() {
+                for child in array {
+                    assert_extensible(child);
+                }
+            }
+        }
+        assert_extensible(&schema);
     }
 }

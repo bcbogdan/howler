@@ -1,7 +1,8 @@
 #![forbid(unsafe_code)]
 
 use howler_editor::{
-    front_matter_end, EditResult, EditorCommand, EditorError, EditorSession, Transaction,
+    front_matter_end, Decoration, EditResult, EditorCommand, EditorError, EditorSession, Snapshot,
+    Transaction,
 };
 use rusqlite::{params, Connection, Transaction as SqlTransaction};
 use serde::{Deserialize, Serialize};
@@ -54,6 +55,10 @@ pub enum AppError {
     IdentityChanged,
     #[error("note editor is stale because the note was moved or trashed")]
     StaleHandle,
+    #[error("note is already open in another application session: {0}")]
+    NoteAlreadyOpen(String),
+    #[error("pending native input must be resolved before mutating note: {0}")]
+    PendingNativeDraft(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -126,6 +131,22 @@ pub struct RecoveryDraft {
     pub source: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PendingNativeDraftRecord {
+    note_id: String,
+    relative_path: PathBuf,
+    base_revision: u64,
+    source: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct NoteCreationRecord {
+    operation_id: String,
+    note: NoteSummary,
+    request_hash: String,
+    source_hash: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DurabilityState {
@@ -188,32 +209,83 @@ pub struct DiagnosticBundle {
     pub diagnostics: Vec<Diagnostic>,
 }
 
+#[derive(Debug, Default)]
+struct FolderRuntime {
+    operation_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    generations: Arc<Mutex<HashMap<String, u64>>>,
+    open_editors: Arc<Mutex<HashSet<String>>>,
+    folder_transition: Arc<Mutex<()>>,
+}
+
+#[derive(Debug, Default)]
+pub struct ApplicationServices {
+    folders: Mutex<HashMap<PathBuf, Weak<FolderRuntime>>>,
+}
+
+static DEFAULT_APPLICATION_SERVICES: OnceLock<Arc<ApplicationServices>> = OnceLock::new();
+
+impl ApplicationServices {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    fn shared() -> Arc<Self> {
+        Arc::clone(DEFAULT_APPLICATION_SERVICES.get_or_init(Self::new))
+    }
+
+    fn runtime(&self, root: &Path) -> Arc<FolderRuntime> {
+        let mut folders = self
+            .folders
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(runtime) = folders.get(root).and_then(Weak::upgrade) {
+            return runtime;
+        }
+        let runtime = Arc::new(FolderRuntime::default());
+        folders.insert(root.to_path_buf(), Arc::downgrade(&runtime));
+        runtime
+    }
+}
+
 pub struct NoteFolder {
+    _runtime: Arc<FolderRuntime>,
     root: PathBuf,
     state_dir: PathBuf,
     index: Connection,
     state: Connection,
     adopted: bool,
     context_id: String,
-    operation_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    operation_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     generations: Arc<Mutex<HashMap<String, u64>>>,
+    open_editors: Arc<Mutex<HashSet<String>>>,
+    folder_transition: Arc<Mutex<()>>,
 }
 
 pub struct NoteEditor {
+    _runtime: Arc<FolderRuntime>,
     editor: EditorSession,
     note_id: Identity,
     relative_path: PathBuf,
     absolute_path: PathBuf,
     recovery_path: PathBuf,
+    pending_native_draft_path: PathBuf,
     base_hash: String,
     dirty: bool,
     owner_context_id: String,
     generation: u64,
     generations: Arc<Mutex<HashMap<String, u64>>>,
+    operation_lock: Arc<Mutex<()>>,
+    open_editors: Arc<Mutex<HashSet<String>>>,
 }
 
-type GenerationRegistry = Mutex<HashMap<PathBuf, Weak<Mutex<HashMap<String, u64>>>>>;
-static GENERATION_REGISTRY: OnceLock<GenerationRegistry> = OnceLock::new();
+impl Drop for NoteEditor {
+    fn drop(&mut self) {
+        self.open_editors
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(self.note_id.as_str());
+    }
+}
 
 impl NoteFolder {
     pub fn create(
@@ -221,8 +293,18 @@ impl NoteFolder {
         application_state_root: impl AsRef<Path>,
         adopt: bool,
     ) -> Result<Self, AppError> {
+        let services = ApplicationServices::shared();
+        Self::create_with_services(root, application_state_root, adopt, &services)
+    }
+
+    fn create_with_services(
+        root: impl AsRef<Path>,
+        application_state_root: impl AsRef<Path>,
+        adopt: bool,
+        services: &ApplicationServices,
+    ) -> Result<Self, AppError> {
         fs::create_dir_all(root.as_ref())?;
-        Self::open(root, application_state_root, adopt)
+        Self::open_with_services(root, application_state_root, adopt, services)
     }
 
     pub fn open(
@@ -230,7 +312,37 @@ impl NoteFolder {
         application_state_root: impl AsRef<Path>,
         adopt: bool,
     ) -> Result<Self, AppError> {
+        let services = ApplicationServices::shared();
+        Self::open_with_services(root, application_state_root, adopt, &services)
+    }
+
+    fn open_with_services(
+        root: impl AsRef<Path>,
+        application_state_root: impl AsRef<Path>,
+        adopt: bool,
+        services: &ApplicationServices,
+    ) -> Result<Self, AppError> {
         let root = fs::canonicalize(root.as_ref())?;
+        let runtime = services.runtime(&root);
+        let _folder_transition = if adopt {
+            Some(
+                runtime
+                    .folder_transition
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            )
+        } else {
+            None
+        };
+        if adopt {
+            let open_editors = runtime
+                .open_editors
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(id) = open_editors.iter().next() {
+                return Err(AppError::NoteAlreadyOpen(id.clone()));
+            }
+        }
         if !root.is_dir() {
             return Err(AppError::Io(io::Error::other(
                 "note folder is not a directory",
@@ -245,7 +357,11 @@ impl NoteFolder {
                     .join("folders")
                     .join(provisional_folder_id(&root));
                 let manifest = load_or_create_adoption_manifest(&root, &provisional, Some(&id))?;
-                apply_adoption_manifest(&root, &manifest)?;
+                ensure_no_pending_native_drafts_for_adoption(&[
+                    provisional.join("pending-native"),
+                    state_root.join("folders").join(&id).join("pending-native"),
+                ])?;
+                apply_adoption_manifest(&root, &manifest, &runtime.generations)?;
                 let adopted = state_root.join("folders").join(&id);
                 migrate_provisional_state(&provisional, &adopted, &manifest.mappings)?;
                 complete_adoption_manifest(&provisional)?;
@@ -257,7 +373,14 @@ impl NoteFolder {
                     .join("folders")
                     .join(provisional_folder_id(&root));
                 let manifest = load_or_create_adoption_manifest(&root, &provisional, None)?;
-                apply_adoption_manifest(&root, &manifest)?;
+                ensure_no_pending_native_drafts_for_adoption(&[
+                    provisional.join("pending-native"),
+                    state_root
+                        .join("folders")
+                        .join(&manifest.library_id)
+                        .join("pending-native"),
+                ])?;
+                apply_adoption_manifest(&root, &manifest, &runtime.generations)?;
                 let adopted = state_root.join("folders").join(&manifest.library_id);
                 migrate_provisional_state(&provisional, &adopted, &manifest.mappings)?;
                 // Metadata is published only after note and local-state migration completes.
@@ -272,20 +395,24 @@ impl NoteFolder {
             .unwrap_or_else(|| provisional_folder_id(&root));
         let state_dir = state_root.join("folders").join(state_id);
         fs::create_dir_all(state_dir.join("recovery"))?;
+        fs::create_dir_all(state_dir.join("pending-native"))?;
+        fs::create_dir_all(state_dir.join("operations"))?;
         let index = Connection::open(state_dir.join("index.sqlite3"))?;
         initialize_index(&index)?;
         let state = Connection::open(state_dir.join("state.sqlite3"))?;
         initialize_state(&state)?;
-        let generations = folder_generations(&root);
         let folder = Self {
+            _runtime: Arc::clone(&runtime),
             root,
             state_dir,
             index,
             state,
             adopted: library_id.is_some(),
             context_id: Ulid::new().to_string(),
-            operation_locks: Mutex::new(HashMap::new()),
-            generations,
+            operation_locks: Arc::clone(&runtime.operation_locks),
+            generations: Arc::clone(&runtime.generations),
+            open_editors: Arc::clone(&runtime.open_editors),
+            folder_transition: Arc::clone(&runtime.folder_transition),
         };
         folder.rebuild_index()?;
         Ok(folder)
@@ -314,7 +441,7 @@ impl NoteFolder {
     pub fn create_note(&self, initial_source: Option<&str>) -> Result<NoteSummary, AppError> {
         let id = Ulid::new().to_string();
         let source = if self.adopted {
-            adopt_source(initial_source.unwrap_or(""), &id)
+            set_adopted_id(initial_source.unwrap_or(""), &id)
         } else {
             initial_source.unwrap_or("").to_owned()
         };
@@ -331,7 +458,130 @@ impl NoteFolder {
         Ok(note)
     }
 
+    fn create_note_idempotent(
+        &self,
+        initial_source: &str,
+        operation_id: &str,
+        request_key: &str,
+    ) -> Result<NoteSummary, AppError> {
+        validate_operation_id(operation_id)?;
+        let lock = self.note_lock(&format!("operation:{operation_id}"));
+        let _operation = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let record_path = self
+            .state_dir
+            .join("operations")
+            .join(format!("{}.json", safe_key(operation_id)));
+        let (record, source) = if record_path.exists() {
+            let record: NoteCreationRecord = serde_json::from_slice(&fs::read(&record_path)?)
+                .map_err(|error| AppError::MalformedMetadata(error.to_string()))?;
+            if record.operation_id != operation_id {
+                return Err(AppError::MalformedMetadata(
+                    "note-creation operation identity collision".into(),
+                ));
+            }
+            if record.request_hash != hash(request_key) {
+                return Err(AppError::MalformedMetadata(
+                    "note-creation operation was retried with a different request".into(),
+                ));
+            }
+            let source = if self.adopted {
+                set_adopted_id(initial_source, record.note.id.as_str())
+            } else {
+                initial_source.to_owned()
+            };
+            if hash(&source) != record.source_hash {
+                return Err(AppError::MalformedMetadata(
+                    "note-creation operation was retried with different source".into(),
+                ));
+            }
+            (record, source)
+        } else {
+            let seed = Ulid::new().to_string();
+            let relative_path = PathBuf::from(format!("untitled-{}.md", seed.to_lowercase()));
+            let source = if self.adopted {
+                set_adopted_id(initial_source, &seed)
+            } else {
+                initial_source.to_owned()
+            };
+            let note = self.summary_from_source(&relative_path, &source)?;
+            let record = NoteCreationRecord {
+                operation_id: operation_id.into(),
+                note,
+                request_hash: hash(request_key),
+                source_hash: hash(&source),
+            };
+            atomic_write(
+                &record_path,
+                &serde_json::to_vec(&record).map_err(io::Error::other)?,
+            )?;
+            (record, source)
+        };
+        let destination = self.resolve_for_mutation(&record.note.relative_path, true)?;
+        if destination.exists() {
+            let existing = read_utf8(&destination, &record.note.relative_path)?;
+            if existing != source {
+                return Err(AppError::DestinationExists(record.note.relative_path));
+            }
+        } else if let Err(error) = create_no_replace(&destination, source.as_bytes()) {
+            let committed = destination.exists()
+                && read_utf8(&destination, &record.note.relative_path)
+                    .is_ok_and(|value| value == source);
+            if !committed {
+                return Err(error);
+            }
+        }
+        let note = self.summary_from_source(&record.note.relative_path, &source)?;
+        if note.id != record.note.id {
+            return Err(AppError::IdentityChanged);
+        }
+        if let Err(error) = self.index_note(&note, &source) {
+            let _ = self.mark_index_stale(&note.relative_path, &error.to_string());
+        }
+        let _ = self.record_recent(&note.relative_path);
+        Ok(note)
+    }
+
+    fn note_created_by_operation(
+        &self,
+        operation_id: &str,
+        request_key: &str,
+    ) -> Result<Option<NoteSummary>, AppError> {
+        validate_operation_id(operation_id)?;
+        let record_path = self
+            .state_dir
+            .join("operations")
+            .join(format!("{}.json", safe_key(operation_id)));
+        if !record_path.exists() {
+            return Ok(None);
+        }
+        let record: NoteCreationRecord = serde_json::from_slice(&fs::read(record_path)?)
+            .map_err(|error| AppError::MalformedMetadata(error.to_string()))?;
+        if record.operation_id != operation_id || record.request_hash != hash(request_key) {
+            return Err(AppError::MalformedMetadata(
+                "note-creation operation was retried with a different request".into(),
+            ));
+        }
+        Ok(Some(record.note))
+    }
+
     pub fn open_editor(&self, id: &str) -> Result<NoteEditor, AppError> {
+        self.open_editor_with_pending(id, false)
+    }
+
+    fn open_editor_with_pending(
+        &self,
+        id: &str,
+        allow_pending_native_draft: bool,
+    ) -> Result<NoteEditor, AppError> {
+        let transition = Arc::clone(&self.folder_transition);
+        let _transition = transition
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let lock = self.note_lock(id);
+        let _operation = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !allow_pending_native_draft {
+            self.ensure_no_pending_native_draft(id)?;
+        }
         if self.recoveries()?.iter().any(|draft| draft.note_id == id) {
             return Err(AppError::RecoveryPending(id.into()));
         }
@@ -340,6 +590,23 @@ impl NoteFolder {
     }
 
     pub fn restore_recovery(&self, id: &str) -> Result<NoteEditor, AppError> {
+        self.restore_recovery_with_pending(id, false)
+    }
+
+    fn restore_recovery_with_pending(
+        &self,
+        id: &str,
+        allow_pending_native_draft: bool,
+    ) -> Result<NoteEditor, AppError> {
+        let transition = Arc::clone(&self.folder_transition);
+        let _transition = transition
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let lock = self.note_lock(id);
+        let _operation = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !allow_pending_native_draft {
+            self.ensure_no_pending_native_draft(id)?;
+        }
         let draft = self
             .recoveries()?
             .into_iter()
@@ -364,6 +631,8 @@ impl NoteFolder {
 
     pub fn discard_recovery(&self, id: &str) -> Result<(), AppError> {
         validate_identity(id)?;
+        let lock = self.note_lock(id);
+        let _operation = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let path = self.recovery_path(id);
         match fs::remove_file(path) {
             Ok(()) => Ok(()),
@@ -380,6 +649,8 @@ impl NoteFolder {
         expected_revision: u64,
     ) -> Result<SaveOutcome, AppError> {
         self.ensure_owner(editor)?;
+        let lock = self.note_lock(editor.note_id.as_str());
+        let _operation = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let actual = editor.snapshot().revision;
         if expected_revision != actual {
             return Err(EditorError::StaleRevision {
@@ -388,8 +659,6 @@ impl NoteFolder {
             }
             .into());
         }
-        let lock = self.note_lock(editor.note_id.as_str());
-        let _operation = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         self.save_editor_locked(editor, || {}, sync_parent)
     }
 
@@ -533,15 +802,44 @@ impl NoteFolder {
         if title.contains(['\r', '\n']) {
             return Err(AppError::InvalidTitle);
         }
-        let mut editor = self.open_editor(id)?;
+        let lock = self.note_lock(id);
+        let _operation = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.ensure_no_pending_native_draft(id)?;
+        self.ensure_no_pending_recovery(id)?;
+        let note = self.find_unique_note(id)?;
+        let mut editor = self.editor_for_note(note, None)?;
+        let (summary, _) = self.rename_editor_title_locked(&mut editor, title)?;
+        Ok(summary)
+    }
+
+    fn rename_editor_title(
+        &self,
+        editor: &mut NoteEditor,
+        title: &str,
+    ) -> Result<(NoteSummary, SaveOutcome), AppError> {
+        if title.contains(['\r', '\n']) {
+            return Err(AppError::InvalidTitle);
+        }
+        self.ensure_owner(editor)?;
+        let lock = self.note_lock(editor.note_id.as_str());
+        let _operation = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.ensure_no_pending_native_draft(editor.note_id.as_str())?;
+        self.rename_editor_title_locked(editor, title)
+    }
+
+    fn rename_editor_title_locked(
+        &self,
+        editor: &mut NoteEditor,
+        title: &str,
+    ) -> Result<(NoteSummary, SaveOutcome), AppError> {
+        editor.ensure_current_generation()?;
         let source = editor.editor.snapshot().source;
         let replacement = rename_title_source(&source, title)?;
         editor.editor.replace_external(&replacement);
         editor.dirty = true;
         let _ = editor.persist_recovery();
-        let revision = editor.snapshot().revision;
-        self.save_editor(&mut editor, revision)?;
-        self.summary_for_path(&editor.relative_path)
+        let save = self.save_editor_locked(editor, || {}, sync_parent)?;
+        Ok((self.summary_for_path(&editor.relative_path)?, save))
     }
 
     pub fn move_note(
@@ -552,12 +850,61 @@ impl NoteFolder {
         let note = self.find_unique_note(id)?;
         let lock = self.note_lock(id);
         let _operation = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.ensure_no_pending_native_draft(id)?;
         self.ensure_no_pending_recovery(id)?;
+        self.move_note_locked(&note, destination.as_ref())
+            .map(|(summary, _)| summary)
+    }
+
+    fn move_editor(
+        &self,
+        editor: &mut NoteEditor,
+        destination: &Path,
+    ) -> Result<NoteSummary, AppError> {
+        self.ensure_owner(editor)?;
+        let old_id = editor.note_id.as_str().to_owned();
+        let lock = self.note_lock(&old_id);
+        let _operation = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.ensure_no_pending_native_draft(&old_id)?;
+        editor.ensure_current_generation()?;
+        let note = NoteSummary {
+            id: editor.note_id.clone(),
+            relative_path: editor.relative_path.clone(),
+            title: derive_title(&editor.editor.snapshot().source),
+            content_hash: hash(&editor.editor.snapshot().source),
+        };
+        let mut open_editors = self
+            .open_editors
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (summary, absolute_path) = self.move_note_locked(&note, destination)?;
+        let new_id = summary.id.as_str().to_owned();
+        open_editors.remove(&old_id);
+        let inserted = open_editors.insert(new_id);
+        debug_assert!(inserted);
+        drop(open_editors);
+        editor.note_id = summary.id.clone();
+        editor.relative_path = summary.relative_path.clone();
+        editor.absolute_path = absolute_path;
+        editor.recovery_path = self.recovery_path(summary.id.as_str());
+        editor.pending_native_draft_path = self.pending_native_draft_path(summary.id.as_str());
+        editor.generation = self.generation(summary.id.as_str());
+        editor.operation_lock = self.note_lock(summary.id.as_str());
+        Ok(summary)
+    }
+
+    fn move_note_locked(
+        &self,
+        note: &NoteSummary,
+        destination: &Path,
+    ) -> Result<(NoteSummary, PathBuf), AppError> {
         let from = self.resolve_existing(&note.relative_path)?;
-        let destination = normalized_relative(destination.as_ref())?;
+        let source = read_utf8(&from, &note.relative_path)?;
+        let destination = normalized_relative(destination)?;
         if !is_markdown(&destination) {
             return Err(AppError::PathEscape);
         }
+        let summary = self.summary_from_source(&destination, &source)?;
         let to = self.resolve_for_mutation(&destination, true)?;
         if to.exists() {
             return Err(AppError::DestinationExists(destination));
@@ -572,8 +919,7 @@ impl NoteFolder {
                 error.into()
             }
         })?;
-        self.bump_generation(id);
-        let summary = self.summary_for_path(&destination)?;
+        self.bump_generation(note.id.as_str());
         let _ = self.state.execute(
             "UPDATE recent_notes SET path=?1 WHERE path=?2",
             params![
@@ -584,13 +930,14 @@ impl NoteFolder {
         if let Err(error) = self.rebuild_index() {
             let _ = self.mark_index_stale(&destination, &error.to_string());
         }
-        Ok(summary)
+        Ok((summary, to))
     }
 
     pub fn trash(&self, id: &str) -> Result<PathBuf, AppError> {
         let note = self.find_unique_note(id)?;
         let lock = self.note_lock(id);
         let _operation = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.ensure_no_pending_native_draft(id)?;
         self.ensure_no_pending_recovery(id)?;
         let source = self.resolve_existing(&note.relative_path)?;
         self.create_safe_parents(Path::new(".trash/placeholder"))?;
@@ -668,6 +1015,23 @@ impl NoteFolder {
             }
         }
         drafts.sort_by(|left: &RecoveryDraft, right| left.note_id.cmp(&right.note_id));
+        Ok(drafts)
+    }
+
+    fn pending_native_drafts(&self) -> Result<Vec<PendingNativeDraftRecord>, AppError> {
+        let mut drafts = Vec::new();
+        for entry in fs::read_dir(self.state_dir.join("pending-native"))? {
+            let path = entry?.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let draft: PendingNativeDraftRecord = serde_json::from_slice(&fs::read(path)?)
+                .map_err(|error| AppError::MalformedMetadata(error.to_string()))?;
+            validate_identity(&draft.note_id)?;
+            normalized_relative(&draft.relative_path)?;
+            drafts.push(draft);
+        }
+        drafts.sort_by(|left, right| left.note_id.cmp(&right.note_id));
         Ok(drafts)
     }
 
@@ -991,9 +1355,20 @@ impl NoteFolder {
         }
         self.record_recent(&note.relative_path)?;
         let generation = self.generation(note.id.as_str());
+        let operation_lock = self.note_lock(note.id.as_str());
+        let mut open_editors = self
+            .open_editors
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !open_editors.insert(note.id.as_str().to_owned()) {
+            return Err(AppError::NoteAlreadyOpen(note.id.as_str().into()));
+        }
+        drop(open_editors);
         Ok(NoteEditor {
+            _runtime: Arc::clone(&self._runtime),
             editor,
             recovery_path: self.recovery_path(note.id.as_str()),
+            pending_native_draft_path: self.pending_native_draft_path(note.id.as_str()),
             note_id: note.id,
             relative_path: note.relative_path,
             absolute_path,
@@ -1002,6 +1377,8 @@ impl NoteFolder {
             owner_context_id: self.context_id.clone(),
             generation,
             generations: Arc::clone(&self.generations),
+            operation_lock,
+            open_editors: Arc::clone(&self.open_editors),
         })
     }
 
@@ -1107,9 +1484,27 @@ impl NoteFolder {
         }
     }
 
+    fn ensure_no_pending_native_draft(&self, id: &str) -> Result<(), AppError> {
+        if self
+            .pending_native_drafts()?
+            .iter()
+            .any(|draft| draft.note_id == id)
+        {
+            Err(AppError::PendingNativeDraft(id.into()))
+        } else {
+            Ok(())
+        }
+    }
+
     fn recovery_path(&self, id: &str) -> PathBuf {
         self.state_dir
             .join("recovery")
+            .join(format!("{}.json", safe_key(id)))
+    }
+
+    fn pending_native_draft_path(&self, id: &str) -> PathBuf {
+        self.state_dir
+            .join("pending-native")
             .join(format!("{}.json", safe_key(id)))
     }
 
@@ -1227,7 +1622,65 @@ impl NoteEditor {
         self.dirty
     }
 
+    fn persist_active_recovery(&self) -> Result<(), AppError> {
+        let lock = Arc::clone(&self.operation_lock);
+        let _operation = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.persist_recovery()
+    }
+
+    fn persist_pending_native_draft(&self, draft: &PendingNativeDraft) -> Result<(), AppError> {
+        let lock = Arc::clone(&self.operation_lock);
+        let _operation = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let record = PendingNativeDraftRecord {
+            note_id: self.note_id.as_str().into(),
+            relative_path: self.relative_path.clone(),
+            base_revision: draft.base_revision,
+            source: draft.source.clone(),
+        };
+        let bytes = serde_json::to_vec(&record).map_err(io::Error::other)?;
+        atomic_write(&self.pending_native_draft_path, &bytes)
+    }
+
+    fn clear_pending_native_draft(&self) -> Result<(), AppError> {
+        let lock = Arc::clone(&self.operation_lock);
+        let _operation = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        match fs::remove_file(&self.pending_native_draft_path) {
+            Ok(()) => sync_parent(
+                self.pending_native_draft_path
+                    .parent()
+                    .ok_or(AppError::PathEscape)?,
+            ),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn install_external(&mut self, expected_hash: &str) -> Result<(), AppError> {
+        let lock = Arc::clone(&self.operation_lock);
+        let _operation = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.ensure_current_generation()?;
+        let external = read_utf8(&self.absolute_path, &self.relative_path)?;
+        ensure_same_identity(&self.note_id, &external)?;
+        let external_hash = hash(&external);
+        if external_hash != expected_hash {
+            return Err(AppError::ExternalConflict {
+                external_source: external,
+            });
+        }
+        match fs::remove_file(&self.recovery_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        self.editor.replace_external(&external);
+        self.base_hash = external_hash;
+        self.dirty = false;
+        Ok(())
+    }
+
     pub fn apply(&mut self, transaction: Transaction) -> Result<MutationOutcome, AppError> {
+        let lock = Arc::clone(&self.operation_lock);
+        let _operation = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         self.ensure_current_generation()?;
         let result = self.editor.apply(transaction)?;
         self.accepted(Some(result))
@@ -1238,12 +1691,16 @@ impl NoteEditor {
         expected_revision: u64,
         command: EditorCommand,
     ) -> Result<MutationOutcome, AppError> {
+        let lock = Arc::clone(&self.operation_lock);
+        let _operation = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         self.ensure_current_generation()?;
         let result = self.editor.execute_command(expected_revision, command)?;
         self.accepted(Some(result))
     }
 
     pub fn undo(&mut self, expected_revision: u64) -> Result<MutationOutcome, AppError> {
+        let lock = Arc::clone(&self.operation_lock);
+        let _operation = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         self.ensure_current_generation()?;
         let result = self.editor.undo(expected_revision)?;
         if result.is_none() {
@@ -1261,6 +1718,8 @@ impl NoteEditor {
     }
 
     pub fn redo(&mut self, expected_revision: u64) -> Result<MutationOutcome, AppError> {
+        let lock = Arc::clone(&self.operation_lock);
+        let _operation = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         self.ensure_current_generation()?;
         let result = self.editor.redo(expected_revision)?;
         if result.is_none() {
@@ -1278,8 +1737,11 @@ impl NoteEditor {
     }
 
     pub fn reconcile_external(&mut self) -> Result<ReconcileResult, AppError> {
+        let lock = Arc::clone(&self.operation_lock);
+        let _operation = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         self.ensure_current_generation()?;
         let external = read_utf8(&self.absolute_path, &self.relative_path)?;
+        ensure_same_identity(&self.note_id, &external)?;
         let external_hash = hash(&external);
         if external_hash == self.base_hash {
             return Ok(ReconcileResult::Unchanged);
@@ -1336,6 +1798,1652 @@ impl NoteEditor {
             return Err(AppError::StaleHandle);
         }
         Ok(())
+    }
+}
+
+impl ApplicationServices {
+    fn connect_folder(&self, request: &ConnectFolder) -> Result<NoteFolder, AppError> {
+        if request.create_missing {
+            NoteFolder::create_with_services(
+                &request.folder_path,
+                &request.application_state_path,
+                request.adopt,
+                self,
+            )
+        } else {
+            NoteFolder::open_with_services(
+                &request.folder_path,
+                &request.application_state_path,
+                request.adopt,
+                self,
+            )
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConnectFolder {
+    pub folder_path: PathBuf,
+    pub application_state_path: PathBuf,
+    #[serde(default)]
+    pub adopt: bool,
+    #[serde(default)]
+    pub create_missing: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateNote {
+    #[serde(default)]
+    pub source: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RenameNote {
+    pub note_id: String,
+    pub title: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MoveNote {
+    pub note_id: String,
+    pub destination: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RestoreNote {
+    pub trash_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchQuery {
+    pub query: String,
+    #[serde(default = "default_search_limit")]
+    pub limit: usize,
+}
+
+fn default_search_limit() -> usize {
+    40
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompositionCommit {
+    pub original_range: howler_editor::TextRange,
+    pub original_text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostTextEdit {
+    pub expected_revision: u64,
+    pub replacements: Vec<howler_editor::Replacement>,
+    pub selections: Vec<howler_editor::Selection>,
+    pub history: howler_editor::HistoryHint,
+    #[serde(default)]
+    pub composition: Option<CompositionCommit>,
+}
+
+impl From<HostTextEdit> for Transaction {
+    fn from(edit: HostTextEdit) -> Self {
+        Self {
+            expected_revision: edit.expected_revision,
+            replacements: edit.replacements,
+            selections: edit.selections,
+            history: edit.history,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingNativeDraft {
+    pub base_revision: u64,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "resolution", rename_all = "snake_case")]
+pub enum PendingDraftResolution {
+    SaveAsNew {
+        operation_id: String,
+        title: Option<String>,
+    },
+    Discard,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "resolution", rename_all = "snake_case")]
+pub enum ConflictResolution {
+    UseExternal {
+        expected_external_hash: String,
+    },
+    KeepLocalAsNewNote {
+        operation_id: String,
+        expected_external_hash: String,
+        title: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SaveTarget {
+    pub note_id: Identity,
+    pub revision: u64,
+    pub generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplacementSafety {
+    Safe,
+    MustRetainEditor,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PersistenceIssue {
+    RecoveryWrite { diagnostic: String },
+    CanonicalWrite { diagnostic: String },
+    CanonicalDurabilityUncertain { diagnostic: String },
+    RecoveryCleanup { diagnostic: String },
+    IndexStale { diagnostic: String },
+    RecencyUpdate { diagnostic: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistenceState {
+    pub durability: DurabilityState,
+    pub replacement_safety: ReplacementSafety,
+    pub issues: Vec<PersistenceIssue>,
+}
+
+impl PersistenceState {
+    fn saved() -> Self {
+        Self {
+            durability: DurabilityState::FileSaved,
+            replacement_safety: ReplacementSafety::Safe,
+            issues: Vec::new(),
+        }
+    }
+
+    fn from_mutation(outcome: &MutationOutcome) -> Self {
+        let issues = outcome
+            .recovery_error
+            .iter()
+            .map(|diagnostic| PersistenceIssue::RecoveryWrite {
+                diagnostic: diagnostic.clone(),
+            })
+            .collect();
+        Self {
+            durability: outcome.durability,
+            replacement_safety: if outcome.durability == DurabilityState::Accepted {
+                ReplacementSafety::MustRetainEditor
+            } else {
+                ReplacementSafety::Safe
+            },
+            issues,
+        }
+    }
+
+    fn from_save(outcome: &SaveOutcome) -> Self {
+        let mut issues = Vec::new();
+        if let Some(diagnostic) = &outcome.canonical_error {
+            let issue = if diagnostic.contains("durability is uncertain")
+                || diagnostic.contains("parent sync failed")
+            {
+                PersistenceIssue::CanonicalDurabilityUncertain {
+                    diagnostic: diagnostic.clone(),
+                }
+            } else {
+                PersistenceIssue::CanonicalWrite {
+                    diagnostic: diagnostic.clone(),
+                }
+            };
+            issues.push(issue);
+        }
+        if let Some(diagnostic) = &outcome.recovery_cleanup_error {
+            issues.push(PersistenceIssue::RecoveryCleanup {
+                diagnostic: diagnostic.clone(),
+            });
+        }
+        if let Some(diagnostic) = &outcome.index_error {
+            issues.push(PersistenceIssue::IndexStale {
+                diagnostic: diagnostic.clone(),
+            });
+        }
+        if let Some(diagnostic) = &outcome.recency_error {
+            issues.push(PersistenceIssue::RecencyUpdate {
+                diagnostic: diagnostic.clone(),
+            });
+        }
+        Self {
+            durability: outcome.durability,
+            replacement_safety: if outcome.durability == DurabilityState::Accepted {
+                ReplacementSafety::MustRetainEditor
+            } else {
+                ReplacementSafety::Safe
+            },
+            issues,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConflictState {
+    pub external_source: String,
+    pub external_hash: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingNativeDraftState {
+    pub base_revision: u64,
+    pub source: String,
+    pub durable: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DecorationSet {
+    pub revision: u64,
+    pub items: Vec<Decoration>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EditorPresentationState {
+    pub snapshot: Snapshot,
+    pub decorations: DecorationSet,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActiveEditorState {
+    pub note_id: Identity,
+    pub editor: EditorPresentationState,
+    pub persistence: PersistenceState,
+    pub conflict: Option<ConflictState>,
+    pub pending_native_draft: Option<PendingNativeDraftState>,
+    pub generation: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FolderState {
+    pub path: PathBuf,
+    pub adopted: bool,
+    pub generation: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApplicationState {
+    pub folder: Option<FolderState>,
+    pub active: Option<ActiveEditorState>,
+    pub recoveries: Vec<RecoveryDraft>,
+    pub background_tasks: Vec<BackgroundTaskState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackgroundTaskState {
+    pub id: String,
+    pub operation: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConnectResult {
+    pub opened_note: Option<NoteSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NoteResult {
+    pub note: NoteSummary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrashResult {
+    pub trash_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SaveResult {
+    pub save: SaveOutcome,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProblemCode {
+    NotConnected,
+    NoteNotFound,
+    RecoveryNotFound,
+    RecoveryPending,
+    StaleRevision,
+    ExternalConflict,
+    IdentityChanged,
+    StaleEditor,
+    WrongOwner,
+    DestinationExists,
+    DuplicateIdentity,
+    InvalidOperation,
+    PersistenceFailure,
+    TaskNotFound,
+    ContentHashMismatch,
+    AdoptionRequired,
+    DatabaseFailure,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProblemDetails {
+    StaleRevision {
+        expected_revision: u64,
+        current_revision: u64,
+    },
+    ExternalConflict {
+        external_source: String,
+        external_hash: String,
+    },
+    RecoveryPending {
+        note_id: Identity,
+    },
+    Persistence {
+        issues: Vec<PersistenceIssue>,
+    },
+    ContentHashMismatch {
+        expected_hash: String,
+        current_hash: String,
+    },
+    AdoptionRequired {
+        folder_path: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApplicationProblem {
+    pub code: ProblemCode,
+    pub diagnostic: String,
+    pub details: Option<ProblemDetails>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "status", content = "value", rename_all = "snake_case")]
+pub enum OperationOutcome<T> {
+    Applied(T),
+    Rejected(ApplicationProblem),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApplicationResponse<T> {
+    pub state: ApplicationState,
+    pub effects: Vec<HostEffect>,
+    pub outcome: OperationOutcome<T>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum HostEffect {
+    ScheduleAutosave {
+        effect_id: String,
+        delay_ms: u64,
+        target: SaveTarget,
+    },
+    CancelEffect {
+        effect_id: String,
+    },
+}
+
+struct FolderContext {
+    folder: NoteFolder,
+    request: ConnectFolder,
+}
+
+struct ActiveEditor {
+    note_id: Identity,
+    editor: NoteEditor,
+    persistence: PersistenceState,
+    conflict: Option<ConflictState>,
+    pending_native_draft: Option<PendingNativeDraftState>,
+    autosave_effect_id: Option<String>,
+    generation: u64,
+}
+
+pub struct ApplicationSession {
+    services: Arc<ApplicationServices>,
+    folder: Option<FolderContext>,
+    active: Option<ActiveEditor>,
+    recoveries: Vec<RecoveryDraft>,
+    generation: u64,
+    next_effect_id: u64,
+}
+
+impl Default for ApplicationSession {
+    fn default() -> Self {
+        Self::new(ApplicationServices::shared())
+    }
+}
+
+impl ApplicationSession {
+    pub fn new(services: Arc<ApplicationServices>) -> Self {
+        Self {
+            services,
+            folder: None,
+            active: None,
+            recoveries: Vec::new(),
+            generation: 0,
+            next_effect_id: 0,
+        }
+    }
+
+    pub fn services(&self) -> &Arc<ApplicationServices> {
+        &self.services
+    }
+
+    pub fn state(&self) -> ApplicationState {
+        ApplicationState {
+            folder: self.folder.as_ref().map(|context| FolderState {
+                path: context.folder.root().to_path_buf(),
+                adopted: context.folder.is_adopted(),
+                generation: self.generation,
+            }),
+            active: self.active.as_ref().map(|active| {
+                let snapshot = active.editor.snapshot();
+                let decorations = howler_editor::markdown_projection(&snapshot.source).0;
+                let mut persistence = active.persistence.clone();
+                if active.pending_native_draft.is_some() {
+                    persistence.replacement_safety = ReplacementSafety::MustRetainEditor;
+                }
+                ActiveEditorState {
+                    note_id: active.note_id.clone(),
+                    editor: EditorPresentationState {
+                        decorations: DecorationSet {
+                            revision: snapshot.revision,
+                            items: decorations,
+                        },
+                        snapshot,
+                    },
+                    persistence,
+                    conflict: active.conflict.clone(),
+                    pending_native_draft: active.pending_native_draft.clone(),
+                    generation: active.generation,
+                }
+            }),
+            recoveries: self.recoveries.clone(),
+            background_tasks: Vec::new(),
+        }
+    }
+
+    pub fn inspect(&self) -> ApplicationResponse<()> {
+        self.applied((), Vec::new())
+    }
+
+    pub fn connect(&mut self, request: ConnectFolder) -> ApplicationResponse<ConnectResult> {
+        let mut effects = Vec::new();
+        if let Err(problem) = self.prepare_replacement(&mut effects) {
+            return self.rejected(problem, effects);
+        }
+        let opened = self.services.connect_folder(&request);
+        let folder = match opened {
+            Ok(folder) => folder,
+            Err(error) => return self.rejected(problem_from_error(error), effects),
+        };
+        let recoveries = match folder.recoveries() {
+            Ok(recoveries) => recoveries,
+            Err(error) => return self.rejected(problem_from_error(error), effects),
+        };
+        self.cancel_active_effect(&mut effects);
+        self.active = None;
+        self.generation += 1;
+        self.recoveries = recoveries;
+        self.folder = Some(FolderContext {
+            folder,
+            request: request.clone(),
+        });
+        let notes = match self.folder_ref().and_then(NoteFolder::discover) {
+            Ok(notes) => notes,
+            Err(error) => return self.rejected(problem_from_error(error), effects),
+        };
+        let pending = match self
+            .folder_ref()
+            .and_then(NoteFolder::pending_native_drafts)
+        {
+            Ok(pending) => pending,
+            Err(error) => return self.rejected(problem_from_error(error), effects),
+        };
+        let note = if notes.is_empty() {
+            match self
+                .folder_ref()
+                .and_then(|folder| folder.create_note(None))
+            {
+                Ok(note) => Some(note),
+                Err(error) => return self.rejected(problem_from_error(error), effects),
+            }
+        } else {
+            pending
+                .iter()
+                .find_map(|draft| {
+                    notes
+                        .iter()
+                        .find(|note| note.id.as_str() == draft.note_id)
+                        .cloned()
+                })
+                .or_else(|| {
+                    notes.into_iter().find(|note| {
+                        !self
+                            .recoveries
+                            .iter()
+                            .any(|draft| draft.note_id == note.id.as_str())
+                    })
+                })
+        };
+        let opened_note = if let Some(note) = note {
+            if let Err(error) = self.install_editor(&note) {
+                return self.rejected(problem_from_error(error), effects);
+            }
+            Some(note)
+        } else {
+            None
+        };
+        self.applied(ConnectResult { opened_note }, effects)
+    }
+
+    pub fn adopt_folder(&mut self) -> ApplicationResponse<ConnectResult> {
+        let Some(context) = self.folder.as_ref() else {
+            return self.rejected(
+                simple_problem(ProblemCode::NotConnected, "no folder is connected"),
+                Vec::new(),
+            );
+        };
+        let mut request = context.request.clone();
+        request.adopt = true;
+        self.connect(request)
+    }
+
+    pub fn create_note(&mut self, request: CreateNote) -> ApplicationResponse<NoteResult> {
+        let mut effects = Vec::new();
+        if let Err(problem) = self.prepare_replacement(&mut effects) {
+            return self.rejected(problem, effects);
+        }
+        let note = match self
+            .folder_ref()
+            .and_then(|folder| folder.create_note(request.source.as_deref()))
+        {
+            Ok(note) => note,
+            Err(error) => return self.rejected(problem_from_error(error), effects),
+        };
+        self.cancel_active_effect(&mut effects);
+        self.generation += 1;
+        if let Err(error) = self.install_editor(&note) {
+            return self.rejected(problem_from_error(error), effects);
+        }
+        self.refresh_recoveries();
+        self.applied(NoteResult { note }, effects)
+    }
+
+    pub fn open_note(&mut self, id: &str) -> ApplicationResponse<NoteResult> {
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|active| active.note_id.as_str() == id)
+        {
+            let note = match self.note_summary(id) {
+                Ok(note) => note,
+                Err(error) => return self.rejected(problem_from_error(error), Vec::new()),
+            };
+            return self.applied(NoteResult { note }, Vec::new());
+        }
+        let mut effects = Vec::new();
+        if let Err(problem) = self.prepare_replacement(&mut effects) {
+            return self.rejected(problem, effects);
+        }
+        let note = match self.note_summary(id) {
+            Ok(note) => note,
+            Err(error) => return self.rejected(problem_from_error(error), effects),
+        };
+        self.cancel_active_effect(&mut effects);
+        self.generation += 1;
+        if let Err(error) = self.install_editor(&note) {
+            return self.rejected(problem_from_error(error), effects);
+        }
+        self.applied(NoteResult { note }, effects)
+    }
+
+    pub fn close_note(&mut self) -> ApplicationResponse<()> {
+        let mut effects = Vec::new();
+        if let Err(problem) = self.prepare_replacement(&mut effects) {
+            return self.rejected(problem, effects);
+        }
+        self.cancel_active_effect(&mut effects);
+        self.active = None;
+        self.generation += 1;
+        self.applied((), effects)
+    }
+
+    pub fn apply_text_edit(&mut self, edit: HostTextEdit) -> ApplicationResponse<EditResult> {
+        if self.active_has_pending_native_draft() {
+            return self.rejected(
+                simple_problem(
+                    ProblemCode::InvalidOperation,
+                    "pending native input must be resolved before editing",
+                ),
+                Vec::new(),
+            );
+        }
+        let outcome = match self.active_mut() {
+            Ok(active) => active.editor.apply(edit.into()),
+            Err(problem) => return self.rejected(problem, Vec::new()),
+        };
+        self.finish_mutation(outcome)
+    }
+
+    pub fn execute_command(
+        &mut self,
+        expected_revision: u64,
+        command: EditorCommand,
+    ) -> ApplicationResponse<EditResult> {
+        if self.active_has_pending_native_draft() {
+            return self.rejected(
+                simple_problem(
+                    ProblemCode::InvalidOperation,
+                    "pending native input must be resolved before editing",
+                ),
+                Vec::new(),
+            );
+        }
+        let outcome = match self.active_mut() {
+            Ok(active) => active.editor.execute_command(expected_revision, command),
+            Err(problem) => return self.rejected(problem, Vec::new()),
+        };
+        self.finish_mutation(outcome)
+    }
+
+    pub fn undo(&mut self, expected_revision: u64) -> ApplicationResponse<Option<EditResult>> {
+        if self.active_has_pending_native_draft() {
+            return self.rejected(
+                simple_problem(
+                    ProblemCode::InvalidOperation,
+                    "pending native input must be resolved before editing",
+                ),
+                Vec::new(),
+            );
+        }
+        let outcome = match self.active_mut() {
+            Ok(active) => active.editor.undo(expected_revision),
+            Err(problem) => return self.rejected(problem, Vec::new()),
+        };
+        self.finish_optional_mutation(outcome)
+    }
+
+    pub fn redo(&mut self, expected_revision: u64) -> ApplicationResponse<Option<EditResult>> {
+        if self.active_has_pending_native_draft() {
+            return self.rejected(
+                simple_problem(
+                    ProblemCode::InvalidOperation,
+                    "pending native input must be resolved before editing",
+                ),
+                Vec::new(),
+            );
+        }
+        let outcome = match self.active_mut() {
+            Ok(active) => active.editor.redo(expected_revision),
+            Err(problem) => return self.rejected(problem, Vec::new()),
+        };
+        self.finish_optional_mutation(outcome)
+    }
+
+    pub fn preserve_pending_native_draft(
+        &mut self,
+        draft: PendingNativeDraft,
+    ) -> ApplicationResponse<()> {
+        let current_revision = match self.active.as_ref() {
+            Some(active) => active.editor.snapshot().revision,
+            None => {
+                return self.rejected(
+                    simple_problem(ProblemCode::InvalidOperation, "no note is open"),
+                    Vec::new(),
+                )
+            }
+        };
+        if draft.base_revision > current_revision {
+            return self.rejected(
+                stale_problem(draft.base_revision, current_revision),
+                Vec::new(),
+            );
+        }
+        let mut effects = Vec::new();
+        self.cancel_active_effect(&mut effects);
+        let active = self.active.as_mut().unwrap();
+        let persisted = active.editor.persist_pending_native_draft(&draft);
+        let durable = persisted.is_ok();
+        active.pending_native_draft = Some(PendingNativeDraftState {
+            base_revision: draft.base_revision,
+            source: draft.source,
+            durable,
+        });
+        if let Err(error) = persisted {
+            let issue = PersistenceIssue::RecoveryWrite {
+                diagnostic: error.to_string(),
+            };
+            active.persistence.issues.push(issue.clone());
+            active.persistence.replacement_safety = ReplacementSafety::MustRetainEditor;
+            return self.rejected(
+                ApplicationProblem {
+                    code: ProblemCode::PersistenceFailure,
+                    diagnostic: error.to_string(),
+                    details: Some(ProblemDetails::Persistence {
+                        issues: vec![issue],
+                    }),
+                },
+                effects,
+            );
+        }
+        active.persistence.replacement_safety = ReplacementSafety::MustRetainEditor;
+        self.applied((), effects)
+    }
+
+    pub fn resolve_pending_native_draft(
+        &mut self,
+        resolution: PendingDraftResolution,
+    ) -> ApplicationResponse<NoteResult> {
+        match resolution {
+            PendingDraftResolution::SaveAsNew {
+                operation_id,
+                title,
+            } => {
+                let request_key = serde_json::to_string(&("pending_save_as_new", &title)).unwrap();
+                let prior = match self.folder_ref().and_then(|folder| {
+                    folder.note_created_by_operation(&operation_id, &request_key)
+                }) {
+                    Ok(prior) => prior,
+                    Err(error) => return self.rejected(problem_from_error(error), Vec::new()),
+                };
+                let pending = self
+                    .active
+                    .as_ref()
+                    .and_then(|active| active.pending_native_draft.clone());
+                let Some(pending) = pending else {
+                    return match prior {
+                        Some(note) => self.applied(NoteResult { note }, Vec::new()),
+                        None => self.rejected(
+                            simple_problem(
+                                ProblemCode::InvalidOperation,
+                                "no pending native draft",
+                            ),
+                            Vec::new(),
+                        ),
+                    };
+                };
+                let source = match title {
+                    Some(title) => match rename_title_source(&pending.source, &title) {
+                        Ok(source) => source,
+                        Err(error) => return self.rejected(problem_from_error(error), Vec::new()),
+                    },
+                    None => pending.source,
+                };
+                let note = match self.folder_ref().and_then(|folder| {
+                    folder.create_note_idempotent(&source, &operation_id, &request_key)
+                }) {
+                    Ok(note) => note,
+                    Err(error) => return self.rejected(problem_from_error(error), Vec::new()),
+                };
+                if let Err(problem) = self.finish_pending_native_draft_resolution() {
+                    return self.rejected(problem, Vec::new());
+                }
+                self.refresh_recoveries();
+                self.applied(NoteResult { note }, Vec::new())
+            }
+            PendingDraftResolution::Discard => {
+                if self
+                    .active
+                    .as_ref()
+                    .and_then(|active| active.pending_native_draft.as_ref())
+                    .is_none()
+                {
+                    return self.rejected(
+                        simple_problem(ProblemCode::InvalidOperation, "no pending native draft"),
+                        Vec::new(),
+                    );
+                }
+                let note = match self.active.as_ref() {
+                    Some(active) => match self.note_summary(active.note_id.as_str()) {
+                        Ok(note) => note,
+                        Err(error) => return self.rejected(problem_from_error(error), Vec::new()),
+                    },
+                    None => unreachable!(),
+                };
+                if let Err(problem) = self.finish_pending_native_draft_resolution() {
+                    return self.rejected(problem, Vec::new());
+                }
+                self.refresh_recoveries();
+                self.applied(NoteResult { note }, Vec::new())
+            }
+        }
+    }
+
+    pub fn save(&mut self, target: SaveTarget) -> ApplicationResponse<SaveResult> {
+        let Some(active) = self.active.as_ref() else {
+            return self.rejected(
+                simple_problem(ProblemCode::InvalidOperation, "no note is open"),
+                Vec::new(),
+            );
+        };
+        let current_revision = active.editor.snapshot().revision;
+        if active.note_id != target.note_id || active.generation != target.generation {
+            return self.rejected(
+                simple_problem(
+                    ProblemCode::StaleEditor,
+                    "save target no longer identifies the active editor",
+                ),
+                Vec::new(),
+            );
+        }
+        if current_revision != target.revision {
+            return self.rejected(stale_problem(target.revision, current_revision), Vec::new());
+        }
+        let result = self.save_current();
+        match result {
+            Ok(save) => self.applied(SaveResult { save }, Vec::new()),
+            Err(problem) => self.rejected(problem, Vec::new()),
+        }
+    }
+
+    pub fn restore_recovery(&mut self, id: &str) -> ApplicationResponse<NoteResult> {
+        let mut effects = Vec::new();
+        if let Err(problem) = self.prepare_replacement(&mut effects) {
+            return self.rejected(problem, effects);
+        }
+        let editor = match self
+            .folder_ref()
+            .and_then(|folder| folder.restore_recovery(id))
+        {
+            Ok(editor) => editor,
+            Err(error) => return self.rejected(problem_from_error(error), effects),
+        };
+        let note = match self.note_summary(id) {
+            Ok(note) => note,
+            Err(error) => return self.rejected(problem_from_error(error), effects),
+        };
+        self.cancel_active_effect(&mut effects);
+        self.generation += 1;
+        let pending_native_draft = match self
+            .folder_ref()
+            .and_then(NoteFolder::pending_native_drafts)
+        {
+            Ok(drafts) => drafts
+                .into_iter()
+                .find(|draft| draft.note_id == id)
+                .map(|draft| PendingNativeDraftState {
+                    base_revision: draft.base_revision,
+                    source: draft.source,
+                    durable: true,
+                }),
+            Err(error) => return self.rejected(problem_from_error(error), effects),
+        };
+        self.active = Some(ActiveEditor {
+            note_id: editor.note_id().clone(),
+            editor,
+            persistence: PersistenceState {
+                durability: DurabilityState::RecoveryDurable,
+                replacement_safety: if pending_native_draft.is_some() {
+                    ReplacementSafety::MustRetainEditor
+                } else {
+                    ReplacementSafety::Safe
+                },
+                issues: Vec::new(),
+            },
+            conflict: None,
+            pending_native_draft,
+            autosave_effect_id: None,
+            generation: self.generation,
+        });
+        self.refresh_recoveries();
+        self.applied(NoteResult { note }, effects)
+    }
+
+    pub fn discard_recovery(&mut self, id: &str) -> ApplicationResponse<()> {
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|active| active.note_id.as_str() == id && active.editor.is_dirty())
+        {
+            return self.rejected(
+                simple_problem(
+                    ProblemCode::InvalidOperation,
+                    "cannot discard recovery for a dirty active editor",
+                ),
+                Vec::new(),
+            );
+        }
+        match self
+            .folder_ref()
+            .and_then(|folder| folder.discard_recovery(id))
+        {
+            Ok(()) => {
+                self.refresh_recoveries();
+                self.applied((), Vec::new())
+            }
+            Err(error) => self.rejected(problem_from_error(error), Vec::new()),
+        }
+    }
+
+    pub fn reconcile_active(&mut self) -> ApplicationResponse<ReconcileResult> {
+        let result = match self.active_mut() {
+            Ok(active) => active.editor.reconcile_external(),
+            Err(problem) => return self.rejected(problem, Vec::new()),
+        };
+        match result {
+            Ok(result) => {
+                if let ReconcileResult::Conflict { external_source } = &result {
+                    if let Some(active) = &mut self.active {
+                        active.conflict = Some(ConflictState {
+                            external_hash: hash(external_source),
+                            external_source: external_source.clone(),
+                        });
+                    }
+                } else if let Some(active) = &mut self.active {
+                    active.conflict = None;
+                }
+                self.applied(result, Vec::new())
+            }
+            Err(error) => self.rejected(problem_from_error(error), Vec::new()),
+        }
+    }
+
+    pub fn resolve_conflict(
+        &mut self,
+        resolution: ConflictResolution,
+    ) -> ApplicationResponse<NoteResult> {
+        let prior = match &resolution {
+            ConflictResolution::UseExternal { .. } => None,
+            ConflictResolution::KeepLocalAsNewNote {
+                operation_id,
+                expected_external_hash,
+                title,
+            } => {
+                let request_key =
+                    serde_json::to_string(&("conflict_keep_local", expected_external_hash, title))
+                        .unwrap();
+                match self
+                    .folder_ref()
+                    .and_then(|folder| folder.note_created_by_operation(operation_id, &request_key))
+                {
+                    Ok(note) => note,
+                    Err(error) => return self.rejected(problem_from_error(error), Vec::new()),
+                }
+            }
+        };
+        let conflict = self
+            .active
+            .as_ref()
+            .and_then(|active| active.conflict.clone());
+        let Some(conflict) = conflict else {
+            return match prior {
+                Some(note) => self.applied(NoteResult { note }, Vec::new()),
+                None => self.rejected(
+                    simple_problem(ProblemCode::InvalidOperation, "no external conflict"),
+                    Vec::new(),
+                ),
+            };
+        };
+        let (expected_hash, operation_id, title, request_key) = match resolution {
+            ConflictResolution::UseExternal {
+                expected_external_hash,
+            } => (expected_external_hash, None, None, None),
+            ConflictResolution::KeepLocalAsNewNote {
+                operation_id,
+                expected_external_hash,
+                title,
+            } => {
+                let request_key = serde_json::to_string(&(
+                    "conflict_keep_local",
+                    &expected_external_hash,
+                    &title,
+                ))
+                .unwrap();
+                (
+                    expected_external_hash,
+                    Some(operation_id),
+                    title,
+                    Some(request_key),
+                )
+            }
+        };
+        if expected_hash != conflict.external_hash {
+            return self.rejected(
+                ApplicationProblem {
+                    code: ProblemCode::ContentHashMismatch,
+                    diagnostic: "external content changed before conflict resolution".into(),
+                    details: Some(ProblemDetails::ContentHashMismatch {
+                        expected_hash,
+                        current_hash: conflict.external_hash,
+                    }),
+                },
+                Vec::new(),
+            );
+        }
+        let mut created_note = None;
+        if let Some(operation_id) = operation_id {
+            let local = self.active.as_ref().unwrap().editor.snapshot().source;
+            let local = match title {
+                Some(title) => match rename_title_source(&local, &title) {
+                    Ok(source) => source,
+                    Err(error) => return self.rejected(problem_from_error(error), Vec::new()),
+                },
+                None => local,
+            };
+            match self.folder_ref().and_then(|folder| {
+                folder.create_note_idempotent(&local, &operation_id, request_key.as_ref().unwrap())
+            }) {
+                Ok(note) => created_note = Some(note),
+                Err(error) => return self.rejected(problem_from_error(error), Vec::new()),
+            }
+        }
+        let install = self
+            .active
+            .as_mut()
+            .unwrap()
+            .editor
+            .install_external(&expected_hash);
+        if let Err(error) = install {
+            let problem = problem_from_error(error);
+            if let Some(ProblemDetails::ExternalConflict {
+                external_source,
+                external_hash,
+            }) = &problem.details
+            {
+                self.active.as_mut().unwrap().conflict = Some(ConflictState {
+                    external_source: external_source.clone(),
+                    external_hash: external_hash.clone(),
+                });
+            }
+            return self.rejected(problem, Vec::new());
+        }
+        let id = self.active.as_ref().unwrap().note_id.as_str().to_owned();
+        let note = match self.note_summary(&id) {
+            Ok(note) => note,
+            Err(error) => return self.rejected(problem_from_error(error), Vec::new()),
+        };
+        let active = self.active.as_mut().unwrap();
+        active.conflict = None;
+        active.persistence = PersistenceState::saved();
+        self.refresh_recoveries();
+        self.applied(
+            NoteResult {
+                note: created_note.unwrap_or(note),
+            },
+            Vec::new(),
+        )
+    }
+
+    pub fn search(&self, query: SearchQuery) -> ApplicationResponse<Vec<SearchResult>> {
+        match self
+            .folder_ref()
+            .and_then(|folder| folder.search(&query.query, query.limit))
+        {
+            Ok(results) => self.applied(results, Vec::new()),
+            Err(error) => self.rejected(problem_from_error(error), Vec::new()),
+        }
+    }
+
+    pub fn rename_note(&mut self, request: RenameNote) -> ApplicationResponse<NoteResult> {
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|active| active.note_id.as_str() == request.note_id)
+        {
+            let mut effects = Vec::new();
+            if let Err(problem) = self.prepare_replacement(&mut effects) {
+                return self.rejected(problem, effects);
+            }
+            let result = {
+                let folder = &self.folder.as_ref().unwrap().folder;
+                let active = self.active.as_mut().unwrap();
+                folder.rename_editor_title(&mut active.editor, &request.title)
+            };
+            return match result {
+                Ok((note, save)) => {
+                    self.active.as_mut().unwrap().persistence = PersistenceState::from_save(&save);
+                    self.refresh_recoveries();
+                    self.applied(NoteResult { note }, effects)
+                }
+                Err(error) => self.rejected(problem_from_error(error), effects),
+            };
+        }
+        self.lifecycle_note_mutation(&request.note_id, |folder| {
+            folder.rename_title(&request.note_id, &request.title)
+        })
+    }
+
+    pub fn move_note(&mut self, request: MoveNote) -> ApplicationResponse<NoteResult> {
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|active| active.note_id.as_str() == request.note_id)
+        {
+            let mut effects = Vec::new();
+            if let Err(problem) = self.prepare_replacement(&mut effects) {
+                return self.rejected(problem, effects);
+            }
+            let result = {
+                let folder = &self.folder.as_ref().unwrap().folder;
+                let active = self.active.as_mut().unwrap();
+                folder.move_editor(&mut active.editor, &request.destination)
+            };
+            return match result {
+                Ok(note) => {
+                    self.active.as_mut().unwrap().note_id = note.id.clone();
+                    self.applied(NoteResult { note }, effects)
+                }
+                Err(error) => self.rejected(problem_from_error(error), effects),
+            };
+        }
+        self.lifecycle_note_mutation(&request.note_id, |folder| {
+            folder.move_note(&request.note_id, &request.destination)
+        })
+    }
+
+    pub fn trash_note(&mut self, id: &str) -> ApplicationResponse<TrashResult> {
+        let active_matches = self
+            .active
+            .as_ref()
+            .is_some_and(|active| active.note_id.as_str() == id);
+        let mut effects = Vec::new();
+        if active_matches {
+            if let Err(problem) = self.prepare_replacement(&mut effects) {
+                return self.rejected(problem, effects);
+            }
+        }
+        match self.folder_ref().and_then(|folder| folder.trash(id)) {
+            Ok(trash_path) => {
+                if active_matches {
+                    self.cancel_active_effect(&mut effects);
+                    self.active = None;
+                    self.generation += 1;
+                }
+                self.applied(TrashResult { trash_path }, effects)
+            }
+            Err(error) => self.rejected(problem_from_error(error), effects),
+        }
+    }
+
+    pub fn restore_note(&mut self, request: RestoreNote) -> ApplicationResponse<NoteResult> {
+        match self
+            .folder_ref()
+            .and_then(|folder| folder.restore(&request.trash_path))
+        {
+            Ok(note) => self.applied(NoteResult { note }, Vec::new()),
+            Err(error) => self.rejected(problem_from_error(error), Vec::new()),
+        }
+    }
+
+    pub fn rescan_synchronous(&mut self) -> ApplicationResponse<RescanReport> {
+        let report = match self.folder_ref().and_then(NoteFolder::rescan) {
+            Ok(report) => report,
+            Err(error) => return self.rejected(problem_from_error(error), Vec::new()),
+        };
+        if self.active.is_some() {
+            let reconciliation = self.reconcile_active();
+            if let OperationOutcome::Rejected(problem) = reconciliation.outcome {
+                return self.rejected(problem, reconciliation.effects);
+            }
+        }
+        self.applied(report, Vec::new())
+    }
+
+    pub fn rebuild_synchronous(&self) -> ApplicationResponse<RebuildReport> {
+        match self.folder_ref().and_then(NoteFolder::rebuild_index) {
+            Ok(report) => self.applied(report, Vec::new()),
+            Err(error) => self.rejected(problem_from_error(error), Vec::new()),
+        }
+    }
+
+    pub fn diagnostics(&self) -> ApplicationResponse<Vec<Diagnostic>> {
+        match self.folder_ref().and_then(NoteFolder::diagnostics) {
+            Ok(diagnostics) => self.applied(diagnostics, Vec::new()),
+            Err(error) => self.rejected(problem_from_error(error), Vec::new()),
+        }
+    }
+
+    pub fn diagnostic_bundle(&self) -> ApplicationResponse<DiagnosticBundle> {
+        match self.folder_ref().and_then(NoteFolder::diagnostic_bundle) {
+            Ok(bundle) => self.applied(bundle, Vec::new()),
+            Err(error) => self.rejected(problem_from_error(error), Vec::new()),
+        }
+    }
+
+    fn lifecycle_note_mutation(
+        &mut self,
+        id: &str,
+        operation: impl FnOnce(&NoteFolder) -> Result<NoteSummary, AppError>,
+    ) -> ApplicationResponse<NoteResult> {
+        let active_matches = self
+            .active
+            .as_ref()
+            .is_some_and(|active| active.note_id.as_str() == id);
+        let mut effects = Vec::new();
+        if active_matches {
+            if let Err(problem) = self.prepare_replacement(&mut effects) {
+                return self.rejected(problem, effects);
+            }
+        }
+        let note = match self.folder_ref().and_then(operation) {
+            Ok(note) => note,
+            Err(error) => return self.rejected(problem_from_error(error), effects),
+        };
+        if active_matches {
+            self.cancel_active_effect(&mut effects);
+            self.generation += 1;
+            if let Err(error) = self.install_editor(&note) {
+                return self.rejected(problem_from_error(error), effects);
+            }
+        }
+        self.applied(NoteResult { note }, effects)
+    }
+
+    fn finish_mutation(
+        &mut self,
+        outcome: Result<MutationOutcome, AppError>,
+    ) -> ApplicationResponse<EditResult> {
+        match outcome {
+            Ok(outcome) => {
+                let Some(edit) = outcome.edit.clone() else {
+                    return self.rejected(
+                        simple_problem(ProblemCode::InvalidOperation, "mutation produced no edit"),
+                        Vec::new(),
+                    );
+                };
+                self.active.as_mut().unwrap().persistence =
+                    PersistenceState::from_mutation(&outcome);
+                self.active.as_mut().unwrap().conflict = None;
+                self.refresh_recoveries();
+                let effects = self.schedule_autosave();
+                self.applied(edit, effects)
+            }
+            Err(error) => self.rejected(problem_from_error(error), Vec::new()),
+        }
+    }
+
+    fn finish_optional_mutation(
+        &mut self,
+        outcome: Result<MutationOutcome, AppError>,
+    ) -> ApplicationResponse<Option<EditResult>> {
+        match outcome {
+            Ok(outcome) => {
+                self.active.as_mut().unwrap().persistence =
+                    PersistenceState::from_mutation(&outcome);
+                self.refresh_recoveries();
+                let effects = if outcome.edit.is_some() {
+                    self.schedule_autosave()
+                } else {
+                    Vec::new()
+                };
+                self.applied(outcome.edit, effects)
+            }
+            Err(error) => self.rejected(problem_from_error(error), Vec::new()),
+        }
+    }
+
+    fn prepare_replacement(
+        &mut self,
+        effects: &mut Vec<HostEffect>,
+    ) -> Result<(), ApplicationProblem> {
+        if self.active.is_none() {
+            return Ok(());
+        }
+        if self.active.as_ref().unwrap().pending_native_draft.is_some() {
+            return Err(self.persistence_problem(
+                "pending native input must be resolved before replacing the editor",
+            ));
+        }
+        if self.active.as_ref().unwrap().persistence.replacement_safety
+            == ReplacementSafety::MustRetainEditor
+        {
+            return Err(self.persistence_problem("active editor has no durable copy"));
+        }
+        if self.active.as_ref().unwrap().editor.is_dirty() {
+            match self.save_current() {
+                Ok(_) => {}
+                Err(problem) => {
+                    if self.active.as_ref().unwrap().persistence.replacement_safety
+                        == ReplacementSafety::MustRetainEditor
+                        || matches!(
+                            problem.code,
+                            ProblemCode::ExternalConflict
+                                | ProblemCode::IdentityChanged
+                                | ProblemCode::StaleEditor
+                        )
+                    {
+                        return Err(problem);
+                    }
+                }
+            }
+        }
+        self.cancel_active_effect(effects);
+        Ok(())
+    }
+
+    fn persistence_problem(&self, diagnostic: &str) -> ApplicationProblem {
+        ApplicationProblem {
+            code: ProblemCode::PersistenceFailure,
+            diagnostic: diagnostic.into(),
+            details: Some(ProblemDetails::Persistence {
+                issues: self
+                    .active
+                    .as_ref()
+                    .map(|active| active.persistence.issues.clone())
+                    .unwrap_or_default(),
+            }),
+        }
+    }
+
+    fn finish_pending_native_draft_resolution(&mut self) -> Result<(), ApplicationProblem> {
+        let active = self
+            .active
+            .as_mut()
+            .ok_or_else(|| simple_problem(ProblemCode::InvalidOperation, "no note is open"))?;
+        if active.editor.is_dirty() {
+            if let Err(error) = active.editor.persist_active_recovery() {
+                let issue = PersistenceIssue::RecoveryWrite {
+                    diagnostic: error.to_string(),
+                };
+                active.persistence.issues.push(issue.clone());
+                active.persistence.replacement_safety = ReplacementSafety::MustRetainEditor;
+                return Err(ApplicationProblem {
+                    code: ProblemCode::PersistenceFailure,
+                    diagnostic: error.to_string(),
+                    details: Some(ProblemDetails::Persistence {
+                        issues: vec![issue],
+                    }),
+                });
+            }
+            active.persistence.durability = DurabilityState::RecoveryDurable;
+        }
+        if let Err(error) = active.editor.clear_pending_native_draft() {
+            let issue = PersistenceIssue::RecoveryCleanup {
+                diagnostic: error.to_string(),
+            };
+            active.persistence.issues.push(issue.clone());
+            active.persistence.replacement_safety = ReplacementSafety::MustRetainEditor;
+            return Err(ApplicationProblem {
+                code: ProblemCode::PersistenceFailure,
+                diagnostic: error.to_string(),
+                details: Some(ProblemDetails::Persistence {
+                    issues: vec![issue],
+                }),
+            });
+        }
+        active.pending_native_draft = None;
+        active.persistence.replacement_safety = ReplacementSafety::Safe;
+        Ok(())
+    }
+
+    fn save_current(&mut self) -> Result<SaveOutcome, ApplicationProblem> {
+        let revision = self
+            .active
+            .as_ref()
+            .ok_or_else(|| simple_problem(ProblemCode::InvalidOperation, "no note is open"))?
+            .editor
+            .snapshot()
+            .revision;
+        let result = {
+            let context = self.folder.as_ref().ok_or_else(|| {
+                simple_problem(ProblemCode::NotConnected, "no folder is connected")
+            })?;
+            let active = self.active.as_mut().unwrap();
+            context.folder.save_editor(&mut active.editor, revision)
+        };
+        match result {
+            Ok(save) => {
+                self.active.as_mut().unwrap().persistence = PersistenceState::from_save(&save);
+                if self.active_has_pending_native_draft() {
+                    self.active.as_mut().unwrap().persistence.replacement_safety =
+                        ReplacementSafety::MustRetainEditor;
+                }
+                self.active.as_mut().unwrap().conflict = None;
+                self.refresh_recoveries();
+                Ok(save)
+            }
+            Err(AppError::ExternalConflict { external_source }) => {
+                let conflict = ConflictState {
+                    external_hash: hash(&external_source),
+                    external_source: external_source.clone(),
+                };
+                self.active.as_mut().unwrap().conflict = Some(conflict);
+                self.refresh_recoveries();
+                Err(problem_from_error(AppError::ExternalConflict {
+                    external_source,
+                }))
+            }
+            Err(error) => {
+                self.refresh_recoveries();
+                if matches!(error, AppError::Io(_) | AppError::Database(_)) {
+                    let issue = PersistenceIssue::CanonicalWrite {
+                        diagnostic: error.to_string(),
+                    };
+                    let active = self.active.as_mut().unwrap();
+                    active.persistence.issues.push(issue.clone());
+                    active.persistence.replacement_safety =
+                        if active.persistence.durability == DurabilityState::Accepted {
+                            ReplacementSafety::MustRetainEditor
+                        } else {
+                            ReplacementSafety::Safe
+                        };
+                    Err(ApplicationProblem {
+                        code: ProblemCode::PersistenceFailure,
+                        diagnostic: error.to_string(),
+                        details: Some(ProblemDetails::Persistence {
+                            issues: vec![issue],
+                        }),
+                    })
+                } else {
+                    Err(problem_from_error(error))
+                }
+            }
+        }
+    }
+
+    fn schedule_autosave(&mut self) -> Vec<HostEffect> {
+        let mut effects = Vec::new();
+        self.cancel_active_effect(&mut effects);
+        self.next_effect_id += 1;
+        let effect_id = format!("autosave-{}", self.next_effect_id);
+        let active = self.active.as_mut().unwrap();
+        active.autosave_effect_id = Some(effect_id.clone());
+        effects.push(HostEffect::ScheduleAutosave {
+            effect_id,
+            delay_ms: 750,
+            target: SaveTarget {
+                note_id: active.note_id.clone(),
+                revision: active.editor.snapshot().revision,
+                generation: active.generation,
+            },
+        });
+        effects
+    }
+
+    fn cancel_active_effect(&mut self, effects: &mut Vec<HostEffect>) {
+        if let Some(effect_id) = self
+            .active
+            .as_mut()
+            .and_then(|active| active.autosave_effect_id.take())
+        {
+            effects.push(HostEffect::CancelEffect { effect_id });
+        }
+    }
+
+    fn install_editor(&mut self, note: &NoteSummary) -> Result<(), AppError> {
+        let pending = self
+            .folder_ref()?
+            .pending_native_drafts()?
+            .into_iter()
+            .find(|draft| draft.note_id == note.id.as_str());
+        let recovery_pending = self
+            .recoveries
+            .iter()
+            .any(|draft| draft.note_id == note.id.as_str());
+        let editor = if pending.is_some() && recovery_pending {
+            self.folder_ref()?
+                .restore_recovery_with_pending(note.id.as_str(), true)?
+        } else {
+            self.folder_ref()?
+                .open_editor_with_pending(note.id.as_str(), pending.is_some())?
+        };
+        let pending_native_draft = pending.map(|draft| PendingNativeDraftState {
+            base_revision: draft.base_revision,
+            source: draft.source,
+            durable: true,
+        });
+        self.active = Some(ActiveEditor {
+            note_id: note.id.clone(),
+            editor,
+            persistence: if pending_native_draft.is_some() {
+                PersistenceState {
+                    durability: if recovery_pending {
+                        DurabilityState::RecoveryDurable
+                    } else {
+                        DurabilityState::FileSaved
+                    },
+                    replacement_safety: ReplacementSafety::MustRetainEditor,
+                    issues: Vec::new(),
+                }
+            } else {
+                PersistenceState::saved()
+            },
+            conflict: None,
+            pending_native_draft,
+            autosave_effect_id: None,
+            generation: self.generation,
+        });
+        Ok(())
+    }
+
+    fn note_summary(&self, id: &str) -> Result<NoteSummary, AppError> {
+        self.folder_ref()?
+            .discover()?
+            .into_iter()
+            .find(|note| note.id.as_str() == id)
+            .ok_or_else(|| AppError::NoteNotFound(id.into()))
+    }
+
+    fn folder_ref(&self) -> Result<&NoteFolder, AppError> {
+        self.folder
+            .as_ref()
+            .map(|context| &context.folder)
+            .ok_or_else(|| {
+                AppError::Io(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "no folder is connected",
+                ))
+            })
+    }
+
+    fn active_mut(&mut self) -> Result<&mut ActiveEditor, ApplicationProblem> {
+        self.active
+            .as_mut()
+            .ok_or_else(|| simple_problem(ProblemCode::InvalidOperation, "no note is open"))
+    }
+
+    fn active_has_pending_native_draft(&self) -> bool {
+        self.active
+            .as_ref()
+            .is_some_and(|active| active.pending_native_draft.is_some())
+    }
+
+    fn refresh_recoveries(&mut self) {
+        if let Some(folder) = &self.folder {
+            if let Ok(recoveries) = folder.folder.recoveries() {
+                self.recoveries = recoveries;
+            }
+        }
+    }
+
+    fn applied<T>(&self, value: T, effects: Vec<HostEffect>) -> ApplicationResponse<T> {
+        ApplicationResponse {
+            state: self.state(),
+            effects,
+            outcome: OperationOutcome::Applied(value),
+        }
+    }
+
+    fn rejected<T>(
+        &self,
+        problem: ApplicationProblem,
+        effects: Vec<HostEffect>,
+    ) -> ApplicationResponse<T> {
+        ApplicationResponse {
+            state: self.state(),
+            effects,
+            outcome: OperationOutcome::Rejected(problem),
+        }
+    }
+}
+
+fn simple_problem(code: ProblemCode, diagnostic: impl Into<String>) -> ApplicationProblem {
+    ApplicationProblem {
+        code,
+        diagnostic: diagnostic.into(),
+        details: None,
+    }
+}
+
+fn stale_problem(expected_revision: u64, current_revision: u64) -> ApplicationProblem {
+    ApplicationProblem {
+        code: ProblemCode::StaleRevision,
+        diagnostic: format!(
+            "expected revision {expected_revision}, current revision is {current_revision}"
+        ),
+        details: Some(ProblemDetails::StaleRevision {
+            expected_revision,
+            current_revision,
+        }),
+    }
+}
+
+fn problem_from_error(error: AppError) -> ApplicationProblem {
+    let diagnostic = error.to_string();
+    let (code, details) = match error {
+        AppError::NoteNotFound(_) => (ProblemCode::NoteNotFound, None),
+        AppError::RecoveryNotFound(_) => (ProblemCode::RecoveryNotFound, None),
+        AppError::RecoveryPending(id) => {
+            let identity = if id.len() == 26 {
+                Identity::Adopted(id)
+            } else {
+                Identity::Provisional(id)
+            };
+            (
+                ProblemCode::RecoveryPending,
+                Some(ProblemDetails::RecoveryPending { note_id: identity }),
+            )
+        }
+        AppError::Editor(EditorError::StaleRevision { expected, actual }) => (
+            ProblemCode::StaleRevision,
+            Some(ProblemDetails::StaleRevision {
+                expected_revision: expected,
+                current_revision: actual,
+            }),
+        ),
+        AppError::ExternalConflict { external_source } => {
+            let external_hash = hash(&external_source);
+            (
+                ProblemCode::ExternalConflict,
+                Some(ProblemDetails::ExternalConflict {
+                    external_source,
+                    external_hash,
+                }),
+            )
+        }
+        AppError::IdentityChanged => (ProblemCode::IdentityChanged, None),
+        AppError::StaleHandle => (ProblemCode::StaleEditor, None),
+        AppError::NoteAlreadyOpen(_) | AppError::PendingNativeDraft(_) => {
+            (ProblemCode::InvalidOperation, None)
+        }
+        AppError::WrongOwner => (ProblemCode::WrongOwner, None),
+        AppError::DestinationExists(_) => (ProblemCode::DestinationExists, None),
+        AppError::DuplicateIdentity(_) => (ProblemCode::DuplicateIdentity, None),
+        AppError::Database(_) => (ProblemCode::DatabaseFailure, None),
+        AppError::Io(ref io_error) if io_error.kind() == io::ErrorKind::NotConnected => {
+            (ProblemCode::NotConnected, None)
+        }
+        AppError::Io(_)
+        | AppError::InvalidUtf8(_)
+        | AppError::Editor(_)
+        | AppError::PathEscape
+        | AppError::MalformedMetadata(_)
+        | AppError::InvalidTitle => (ProblemCode::InvalidOperation, None),
+    };
+    ApplicationProblem {
+        code,
+        diagnostic,
+        details,
     }
 }
 
@@ -1494,19 +3602,6 @@ fn validate_no_symlink_components(
     Ok(root.join(relative))
 }
 
-fn folder_generations(root: &Path) -> Arc<Mutex<HashMap<String, u64>>> {
-    let registry = GENERATION_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut registry = registry
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(generations) = registry.get(root).and_then(Weak::upgrade) {
-        return generations;
-    }
-    let generations = Arc::new(Mutex::new(HashMap::new()));
-    registry.insert(root.to_path_buf(), Arc::downgrade(&generations));
-    generations
-}
-
 fn validate_identity(id: &str) -> Result<(), AppError> {
     let valid_ulid = validate_adopted_identity(id).is_ok();
     let valid_provisional = id.len() == 64 && id.bytes().all(|byte| byte.is_ascii_hexdigit());
@@ -1514,6 +3609,21 @@ fn validate_identity(id: &str) -> Result<(), AppError> {
         Ok(())
     } else {
         Err(AppError::MalformedMetadata("invalid howler_id".into()))
+    }
+}
+
+fn validate_operation_id(id: &str) -> Result<(), AppError> {
+    if id.is_empty()
+        || id.len() > 128
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        Err(AppError::MalformedMetadata(
+            "operation_id must be 1-128 ASCII letters, digits, '.', '-', or '_'".into(),
+        ))
+    } else {
+        Ok(())
     }
 }
 
@@ -1814,8 +3924,11 @@ fn adoption_mappings(root: &Path) -> Result<Vec<AdoptionMapping>, AppError> {
     Ok(mappings)
 }
 
-fn apply_adoption_manifest(root: &Path, manifest: &AdoptionManifest) -> Result<(), AppError> {
-    let generations = folder_generations(root);
+fn apply_adoption_manifest(
+    root: &Path,
+    manifest: &AdoptionManifest,
+    generations: &Arc<Mutex<HashMap<String, u64>>>,
+) -> Result<(), AppError> {
     for mapping in &manifest.mappings {
         let path = validate_no_symlink_components(root, &mapping.relative_path, false)?;
         let source = read_utf8(&path, &mapping.relative_path)?;
@@ -1858,7 +3971,10 @@ fn migrate_provisional_state(
         }
         let destination = adopted.join(source.file_name().ok_or(AppError::PathEscape)?);
         if destination.exists() {
-            if source.file_name().and_then(|value| value.to_str()) == Some("recovery") {
+            if matches!(
+                source.file_name().and_then(|value| value.to_str()),
+                Some("recovery" | "pending-native")
+            ) {
                 merge_recovery_directories(&source, &destination)?;
                 fs::remove_dir(&source)?;
                 continue;
@@ -1872,6 +3988,24 @@ fn migrate_provisional_state(
     sync_parent(provisional)?;
     sync_parent(adopted)?;
     sync_parent(parent)?;
+    Ok(())
+}
+
+fn ensure_no_pending_native_drafts_for_adoption(directories: &[PathBuf]) -> Result<(), AppError> {
+    for directory in directories {
+        if !directory.is_dir() {
+            continue;
+        }
+        for entry in fs::read_dir(directory)? {
+            let path = entry?.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let draft: PendingNativeDraftRecord = serde_json::from_slice(&fs::read(path)?)
+                .map_err(|error| AppError::MalformedMetadata(error.to_string()))?;
+            return Err(AppError::PendingNativeDraft(draft.note_id));
+        }
+    }
     Ok(())
 }
 
@@ -2175,8 +4309,23 @@ mod tests {
         assert_eq!(outcome.durability, DurabilityState::RecoveryDurable);
         let revision = editor.snapshot().revision;
         folder.save_editor(&mut editor, revision).unwrap();
+        drop(editor);
         assert_eq!(folder.open_editor(&id).unwrap().note_id().as_str(), id);
         assert_eq!(folder.search("body", 10).unwrap()[0].note.id.as_str(), id);
+    }
+
+    #[test]
+    fn adopted_note_creation_replaces_imported_identity() {
+        let (_notes, _state, folder) = setup(true);
+        let original = folder.create_note(Some("body")).unwrap();
+        let source = folder
+            .open_editor(original.id.as_str())
+            .unwrap()
+            .snapshot()
+            .source;
+        let copy = folder.create_note(Some(&source)).unwrap();
+        assert_ne!(copy.id, original.id);
+        assert_eq!(folder.discover().unwrap().len(), 2);
     }
 
     #[test]
@@ -2363,6 +4512,135 @@ mod tests {
     }
 
     #[test]
+    fn folder_contexts_share_per_note_operation_executors() {
+        let notes = tempfile::tempdir().unwrap();
+        let state_a = tempfile::tempdir().unwrap();
+        let state_b = tempfile::tempdir().unwrap();
+        let folder_a = NoteFolder::open(notes.path(), state_a.path(), false).unwrap();
+        let folder_b = NoteFolder::open(notes.path(), state_b.path(), false).unwrap();
+        assert!(Arc::ptr_eq(
+            &folder_a.operation_locks,
+            &folder_b.operation_locks
+        ));
+        assert!(Arc::ptr_eq(&folder_a.generations, &folder_b.generations));
+    }
+
+    #[test]
+    fn all_editor_mutations_and_save_use_shared_per_note_executor() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        fn serialized(
+            mut editor: NoteEditor,
+            operation: impl FnOnce(&mut NoteEditor) + Send + 'static,
+        ) -> NoteEditor {
+            let lock = Arc::clone(&editor.operation_lock);
+            let guard = lock.lock().unwrap();
+            let (started_tx, started_rx) = mpsc::channel();
+            let (finished_tx, finished_rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                operation(&mut editor);
+                finished_tx.send(editor).unwrap();
+            });
+            started_rx.recv().unwrap();
+            assert!(finished_rx.recv_timeout(Duration::from_millis(20)).is_err());
+            drop(guard);
+            finished_rx.recv_timeout(Duration::from_secs(1)).unwrap()
+        }
+
+        let notes = tempfile::tempdir().unwrap();
+        let state_a = tempfile::tempdir().unwrap();
+        let state_b = tempfile::tempdir().unwrap();
+        fs::write(notes.path().join("note.md"), "body").unwrap();
+        let folder_a = NoteFolder::open(notes.path(), state_a.path(), false).unwrap();
+        let folder_b = NoteFolder::open(notes.path(), state_b.path(), false).unwrap();
+        let id = provisional_id(Path::new("note.md"));
+        let mut editor = folder_a.open_editor(&id).unwrap();
+        assert!(matches!(
+            folder_b.open_editor(&id),
+            Err(AppError::NoteAlreadyOpen(_))
+        ));
+
+        editor = serialized(editor, |editor| {
+            editor.apply(transaction(0, 4, 4, "!")).unwrap();
+        });
+        editor = serialized(editor, |editor| {
+            editor
+                .execute_command(
+                    1,
+                    EditorCommand::Bold {
+                        range: TextRange::new(0, 4),
+                    },
+                )
+                .unwrap();
+        });
+        editor = serialized(editor, |editor| {
+            editor.undo(2).unwrap();
+        });
+        editor = serialized(editor, |editor| {
+            editor.redo(3).unwrap();
+        });
+        fs::write(&editor.absolute_path, "external").unwrap();
+        editor = serialized(editor, |editor| {
+            assert!(matches!(
+                editor.reconcile_external().unwrap(),
+                ReconcileResult::Conflict { .. }
+            ));
+        });
+        fs::write(&editor.absolute_path, "body").unwrap();
+
+        let lock = Arc::clone(&editor.operation_lock);
+        let guard = lock.lock().unwrap();
+        let revision = editor.snapshot().revision;
+        let (started_tx, started_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let result = folder_a.save_editor(&mut editor, revision);
+            finished_tx.send(result).unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(finished_rx.recv_timeout(Duration::from_millis(20)).is_err());
+        drop(guard);
+        assert!(finished_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .is_ok());
+    }
+
+    #[test]
+    fn rename_holds_same_note_executor_for_entire_workflow() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let notes = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        fs::write(notes.path().join("note.md"), "# Before\n").unwrap();
+        let folder = NoteFolder::open(notes.path(), state.path(), false).unwrap();
+        let id = provisional_id(Path::new("note.md"));
+        let lock = folder.note_lock(&id);
+        let guard = lock.lock().unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            finished_tx.send(folder.rename_title(&id, "After")).unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(finished_rx.recv_timeout(Duration::from_millis(20)).is_err());
+        drop(guard);
+        let renamed = finished_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(renamed.title, "After");
+        assert!(fs::read_to_string(notes.path().join("note.md"))
+            .unwrap()
+            .contains("# After"));
+    }
+
+    #[test]
     fn save_rejects_stale_revision_without_touching_file() {
         let (notes, _state, folder) = setup(false);
         fs::write(notes.path().join("note.md"), "body").unwrap();
@@ -2411,6 +4689,7 @@ mod tests {
         let id = provisional_id(Path::new("note.md"));
         let mut editor = folder.open_editor(&id).unwrap();
         editor.apply(transaction(0, 4, 4, " draft")).unwrap();
+        drop(editor);
         let restored = folder.restore_recovery(&id).unwrap();
         assert_eq!(restored.snapshot().source, "body draft");
         fs::write(notes.path().join("external.md"), "new file").unwrap();
@@ -2502,6 +4781,7 @@ mod tests {
         let mut editor = folder.open_editor(&id).unwrap();
         editor.apply(transaction(0, 4, 4, " draft")).unwrap();
         fs::write(notes.path().join("note.md"), "external").unwrap();
+        drop(editor);
 
         let mut restored = folder.restore_recovery(&id).unwrap();
         let revision = restored.snapshot().revision;
@@ -2521,6 +4801,7 @@ mod tests {
         let note = folder.create_note(Some("body")).unwrap();
         let mut editor = folder.open_editor(note.id.as_str()).unwrap();
         editor.apply(transaction(0, 4, 4, " draft")).unwrap();
+        drop(editor);
         assert!(matches!(
             folder.open_editor(note.id.as_str()),
             Err(AppError::RecoveryPending(_))
@@ -2591,6 +4872,34 @@ mod tests {
     }
 
     #[test]
+    fn adoption_rejects_and_preserves_pending_native_draft_metadata() {
+        let notes = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        fs::write(notes.path().join("note.md"), "body").unwrap();
+        {
+            let folder = NoteFolder::open(notes.path(), state.path(), false).unwrap();
+            let id = provisional_id(Path::new("note.md"));
+            let editor = folder.open_editor(&id).unwrap();
+            editor
+                .persist_pending_native_draft(&PendingNativeDraft {
+                    base_revision: 0,
+                    source: "body pending".into(),
+                })
+                .unwrap();
+        }
+
+        assert!(matches!(
+            NoteFolder::open(notes.path(), state.path(), true),
+            Err(AppError::PendingNativeDraft(_))
+        ));
+        let folder = NoteFolder::open(notes.path(), state.path(), false).unwrap();
+        let pending = folder.pending_native_drafts().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].note_id.len(), 64);
+        assert_eq!(pending[0].source, "body pending");
+    }
+
+    #[test]
     fn adoption_preserves_conflict_when_recovery_base_predates_external_edit() {
         let notes = tempfile::tempdir().unwrap();
         let state = tempfile::tempdir().unwrap();
@@ -2646,8 +4955,12 @@ mod tests {
             &serde_json::to_vec(&draft).unwrap(),
         )
         .unwrap();
-        apply_adoption_manifest(&root, &manifest).unwrap();
-        apply_adoption_manifest(&root, &manifest).unwrap();
+        let generations = ApplicationServices::shared()
+            .runtime(&root)
+            .generations
+            .clone();
+        apply_adoption_manifest(&root, &manifest, &generations).unwrap();
+        apply_adoption_manifest(&root, &manifest, &generations).unwrap();
         let reloaded = load_or_create_adoption_manifest(&root, &provisional, None).unwrap();
         assert_eq!(
             manifest
@@ -2691,7 +5004,7 @@ mod tests {
             .join("folders")
             .join(provisional_folder_id(folder.root()));
         let manifest = load_or_create_adoption_manifest(folder.root(), &provisional, None).unwrap();
-        apply_adoption_manifest(folder.root(), &manifest).unwrap();
+        apply_adoption_manifest(folder.root(), &manifest, &folder.generations).unwrap();
         assert!(matches!(
             editor.apply(transaction(0, 4, 4, " draft")),
             Err(AppError::StaleHandle)
@@ -2789,5 +5102,799 @@ mod tests {
             NoteFolder::open(adoption_notes.path(), state.path(), true),
             Err(AppError::PathEscape)
         ));
+    }
+
+    fn connect_session(notes: &tempfile::TempDir, state: &tempfile::TempDir) -> ApplicationSession {
+        let mut session = ApplicationSession::default();
+        let response = session.connect(ConnectFolder {
+            folder_path: notes.path().into(),
+            application_state_path: state.path().into(),
+            adopt: false,
+            create_missing: false,
+        });
+        assert!(matches!(response.outcome, OperationOutcome::Applied(_)));
+        session
+    }
+
+    #[test]
+    fn application_session_connects_empty_folder_with_coherent_editor_state() {
+        let notes = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let session = connect_session(&notes, &state);
+        let active = session.state().active.unwrap();
+        assert_eq!(
+            active.editor.snapshot.revision,
+            active.editor.decorations.revision
+        );
+        assert_eq!(
+            active.persistence.replacement_safety,
+            ReplacementSafety::Safe
+        );
+        assert_eq!(session.state().recoveries.len(), 0);
+    }
+
+    #[test]
+    fn application_session_returns_structured_stale_revision_and_current_state() {
+        let notes = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let mut session = connect_session(&notes, &state);
+        let response = session.apply_text_edit(HostTextEdit {
+            expected_revision: 9,
+            replacements: Vec::new(),
+            selections: Vec::new(),
+            history: howler_editor::HistoryHint::Isolated,
+            composition: None,
+        });
+        let OperationOutcome::Rejected(problem) = response.outcome else {
+            panic!("stale edit was applied");
+        };
+        assert!(matches!(problem.code, ProblemCode::StaleRevision));
+        assert!(matches!(
+            problem.details,
+            Some(ProblemDetails::StaleRevision {
+                expected_revision: 9,
+                current_revision: 0
+            })
+        ));
+        assert_eq!(response.state.active.unwrap().editor.snapshot.revision, 0);
+    }
+
+    #[test]
+    fn second_session_cannot_open_or_submit_revision_zero_for_active_note() {
+        let notes = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let services = ApplicationServices::new();
+        let request = ConnectFolder {
+            folder_path: notes.path().into(),
+            application_state_path: state.path().into(),
+            adopt: false,
+            create_missing: false,
+        };
+        let mut first = ApplicationSession::new(Arc::clone(&services));
+        let first_connected = first.connect(request.clone());
+        let note_id = first_connected.state.active.unwrap().note_id;
+        let mut second = ApplicationSession::new(services);
+        let second_connected = second.connect(request);
+        assert!(matches!(
+            second_connected.outcome,
+            OperationOutcome::Rejected(ApplicationProblem {
+                code: ProblemCode::InvalidOperation,
+                ..
+            })
+        ));
+        assert!(second_connected.state.active.is_none());
+        assert!(matches!(
+            second.open_note(note_id.as_str()).outcome,
+            OperationOutcome::Rejected(ApplicationProblem {
+                code: ProblemCode::InvalidOperation,
+                ..
+            })
+        ));
+
+        let first_edit = first.apply_text_edit(HostTextEdit {
+            expected_revision: 0,
+            replacements: vec![howler_editor::Replacement {
+                range: TextRange::new(0, 0),
+                text: "first".into(),
+            }],
+            selections: Vec::new(),
+            history: howler_editor::HistoryHint::Typing,
+            composition: None,
+        });
+        assert!(matches!(first_edit.outcome, OperationOutcome::Applied(_)));
+        assert!(matches!(
+            second.open_note(note_id.as_str()).outcome,
+            OperationOutcome::Rejected(_)
+        ));
+    }
+
+    #[test]
+    fn editor_keeps_runtime_lease_alive_after_folder_drop() {
+        let notes = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        fs::write(notes.path().join("note.md"), "body").unwrap();
+        let folder = NoteFolder::open(notes.path(), state.path(), false).unwrap();
+        let id = provisional_id(Path::new("note.md"));
+        let editor = folder.open_editor(&id).unwrap();
+        drop(folder);
+
+        let reopened = NoteFolder::open(notes.path(), state.path(), false).unwrap();
+        assert!(matches!(
+            reopened.open_editor(&id),
+            Err(AppError::NoteAlreadyOpen(_))
+        ));
+        drop(editor);
+        assert!(reopened.open_editor(&id).is_ok());
+    }
+
+    #[test]
+    fn moving_active_adopted_note_reuses_editor_and_lease() {
+        let notes = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        fs::write(notes.path().join("note.md"), "body").unwrap();
+        let adopted = NoteFolder::open(notes.path(), state.path(), true).unwrap();
+        let id = adopted.discover().unwrap()[0].id.clone();
+        drop(adopted);
+        let mut session = connect_session(&notes, &state);
+
+        let moved = session.move_note(MoveNote {
+            note_id: id.as_str().to_owned(),
+            destination: PathBuf::from("nested/moved.md"),
+        });
+        let OperationOutcome::Applied(result) = moved.outcome else {
+            panic!("active adopted move was rejected");
+        };
+        assert_eq!(result.note.id, id);
+        assert_eq!(result.note.relative_path, Path::new("nested/moved.md"));
+        let active = session.state().active.unwrap();
+        assert_eq!(active.note_id, id);
+        assert!(active.editor.snapshot.source.contains("body"));
+        assert!(active.editor.snapshot.source.contains(id.as_str()));
+        let second_folder = NoteFolder::open(notes.path(), state.path(), false).unwrap();
+        assert!(matches!(
+            second_folder.open_editor(id.as_str()),
+            Err(AppError::NoteAlreadyOpen(_))
+        ));
+        drop(second_folder);
+        assert!(matches!(
+            session
+                .rename_note(RenameNote {
+                    note_id: id.as_str().to_owned(),
+                    title: "Moved title".into(),
+                })
+                .outcome,
+            OperationOutcome::Applied(_)
+        ));
+        assert_eq!(
+            derive_title(&fs::read_to_string(notes.path().join("nested/moved.md")).unwrap()),
+            "Moved title"
+        );
+    }
+
+    #[test]
+    fn application_session_rejects_stale_identified_autosave() {
+        let notes = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let mut session = connect_session(&notes, &state);
+        let response = session.apply_text_edit(HostTextEdit {
+            expected_revision: 0,
+            replacements: vec![howler_editor::Replacement {
+                range: howler_editor::TextRange::new(0, 0),
+                text: "draft".into(),
+            }],
+            selections: Vec::new(),
+            history: howler_editor::HistoryHint::Typing,
+            composition: None,
+        });
+        let target = response
+            .effects
+            .iter()
+            .find_map(|effect| match effect {
+                HostEffect::ScheduleAutosave { target, .. } => Some(target.clone()),
+                _ => None,
+            })
+            .unwrap();
+        let created = session.create_note(CreateNote { source: None });
+        assert!(matches!(created.outcome, OperationOutcome::Applied(_)));
+        let stale = session.save(target);
+        assert!(matches!(
+            stale.outcome,
+            OperationOutcome::Rejected(ApplicationProblem {
+                code: ProblemCode::StaleEditor,
+                ..
+            })
+        ));
+        assert_ne!(
+            stale.state.active.unwrap().note_id,
+            response.state.active.unwrap().note_id
+        );
+    }
+
+    #[test]
+    fn accepted_only_edit_prevents_replacement() {
+        let notes = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let mut session = connect_session(&notes, &state);
+        let recovery = session
+            .folder
+            .as_ref()
+            .unwrap()
+            .folder
+            .state_dir
+            .join("recovery");
+        fs::remove_dir_all(&recovery).unwrap();
+        fs::write(&recovery, "not a directory").unwrap();
+        let edited = session.apply_text_edit(HostTextEdit {
+            expected_revision: 0,
+            replacements: vec![howler_editor::Replacement {
+                range: howler_editor::TextRange::new(0, 0),
+                text: "unsafe".into(),
+            }],
+            selections: Vec::new(),
+            history: howler_editor::HistoryHint::Typing,
+            composition: None,
+        });
+        assert_eq!(
+            edited.state.active.unwrap().persistence.replacement_safety,
+            ReplacementSafety::MustRetainEditor
+        );
+        let replacement = session.create_note(CreateNote { source: None });
+        assert!(matches!(
+            replacement.outcome,
+            OperationOutcome::Rejected(ApplicationProblem {
+                code: ProblemCode::PersistenceFailure,
+                ..
+            })
+        ));
+        assert!(replacement.state.active.is_some());
+    }
+
+    #[test]
+    fn pending_native_draft_survives_autosave_and_blocks_replacement_until_resolution() {
+        let notes = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let mut session = connect_session(&notes, &state);
+        let original_id = session.state().active.unwrap().note_id;
+        let edited = session.apply_text_edit(HostTextEdit {
+            expected_revision: 0,
+            replacements: vec![howler_editor::Replacement {
+                range: howler_editor::TextRange::new(0, 0),
+                text: "active".into(),
+            }],
+            selections: Vec::new(),
+            history: howler_editor::HistoryHint::Typing,
+            composition: None,
+        });
+        let (effect_id, target) = edited
+            .effects
+            .iter()
+            .find_map(|effect| match effect {
+                HostEffect::ScheduleAutosave {
+                    effect_id, target, ..
+                } => Some((effect_id.clone(), target.clone())),
+                _ => None,
+            })
+            .unwrap();
+        let preserved = session.preserve_pending_native_draft(PendingNativeDraft {
+            base_revision: 1,
+            source: "native committed input".into(),
+        });
+        assert!(preserved.effects.iter().any(|effect| matches!(
+            effect,
+            HostEffect::CancelEffect { effect_id: cancelled } if cancelled == &effect_id
+        )));
+        let pending = preserved
+            .state
+            .active
+            .as_ref()
+            .unwrap()
+            .pending_native_draft
+            .as_ref()
+            .unwrap();
+        assert!(pending.durable);
+        assert_eq!(
+            preserved
+                .state
+                .active
+                .unwrap()
+                .persistence
+                .replacement_safety,
+            ReplacementSafety::MustRetainEditor
+        );
+
+        let saved = session.save(target);
+        assert!(matches!(saved.outcome, OperationOutcome::Applied(_)));
+        assert!(saved
+            .state
+            .active
+            .as_ref()
+            .unwrap()
+            .pending_native_draft
+            .is_some());
+        assert_eq!(
+            saved
+                .state
+                .active
+                .as_ref()
+                .unwrap()
+                .persistence
+                .replacement_safety,
+            ReplacementSafety::MustRetainEditor
+        );
+        let persisted = session
+            .folder
+            .as_ref()
+            .unwrap()
+            .folder
+            .pending_native_drafts()
+            .unwrap();
+        assert_eq!(persisted[0].source, "native committed input");
+
+        let replaced = session.create_note(CreateNote { source: None });
+        assert!(matches!(replaced.outcome, OperationOutcome::Rejected(_)));
+        assert_eq!(replaced.state.active.unwrap().note_id, original_id);
+
+        let resolved = session.resolve_pending_native_draft(PendingDraftResolution::Discard);
+        assert!(matches!(resolved.outcome, OperationOutcome::Applied(_)));
+        assert!(resolved
+            .state
+            .active
+            .as_ref()
+            .unwrap()
+            .pending_native_draft
+            .is_none());
+        assert!(session
+            .folder
+            .as_ref()
+            .unwrap()
+            .folder
+            .pending_native_drafts()
+            .unwrap()
+            .is_empty());
+        assert!(matches!(
+            session.create_note(CreateNote { source: None }).outcome,
+            OperationOutcome::Applied(_)
+        ));
+    }
+
+    #[test]
+    fn pending_native_draft_is_reloaded_with_active_recovery_after_restart() {
+        let notes = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let note_id = {
+            let mut session = connect_session(&notes, &state);
+            session.apply_text_edit(HostTextEdit {
+                expected_revision: 0,
+                replacements: vec![howler_editor::Replacement {
+                    range: howler_editor::TextRange::new(0, 0),
+                    text: "active recovery".into(),
+                }],
+                selections: Vec::new(),
+                history: howler_editor::HistoryHint::Typing,
+                composition: None,
+            });
+            let note_id = session.state().active.unwrap().note_id;
+            session.preserve_pending_native_draft(PendingNativeDraft {
+                base_revision: 1,
+                source: "pending native".into(),
+            });
+            note_id
+        };
+
+        let mut session = connect_session(&notes, &state);
+        let active = session.state().active.unwrap();
+        assert_eq!(active.note_id, note_id);
+        assert_eq!(active.editor.snapshot.source, "active recovery");
+        assert_eq!(
+            active.pending_native_draft.unwrap().source,
+            "pending native"
+        );
+        assert_eq!(
+            active.persistence.replacement_safety,
+            ReplacementSafety::MustRetainEditor
+        );
+        let resolved = session.resolve_pending_native_draft(PendingDraftResolution::Discard);
+        assert!(matches!(resolved.outcome, OperationOutcome::Applied(_)));
+        assert!(resolved
+            .state
+            .recoveries
+            .iter()
+            .any(|draft| draft.note_id == note_id.as_str() && draft.source == "active recovery"));
+        assert!(session
+            .folder
+            .as_ref()
+            .unwrap()
+            .folder
+            .pending_native_drafts()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn pending_resolution_failure_keeps_pending_state_and_file() {
+        let notes = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let mut session = connect_session(&notes, &state);
+        session.apply_text_edit(HostTextEdit {
+            expected_revision: 0,
+            replacements: vec![howler_editor::Replacement {
+                range: howler_editor::TextRange::new(0, 0),
+                text: "active".into(),
+            }],
+            selections: Vec::new(),
+            history: howler_editor::HistoryHint::Typing,
+            composition: None,
+        });
+        session.preserve_pending_native_draft(PendingNativeDraft {
+            base_revision: 1,
+            source: "pending".into(),
+        });
+        let recovery = session
+            .folder
+            .as_ref()
+            .unwrap()
+            .folder
+            .state_dir
+            .join("recovery");
+        fs::remove_dir_all(&recovery).unwrap();
+        fs::write(&recovery, "not a directory").unwrap();
+
+        let response = session.resolve_pending_native_draft(PendingDraftResolution::Discard);
+        assert!(matches!(
+            response.outcome,
+            OperationOutcome::Rejected(ApplicationProblem {
+                code: ProblemCode::PersistenceFailure,
+                ..
+            })
+        ));
+        assert!(response
+            .state
+            .active
+            .unwrap()
+            .pending_native_draft
+            .is_some());
+        assert_eq!(
+            session
+                .folder
+                .as_ref()
+                .unwrap()
+                .folder
+                .pending_native_drafts()
+                .unwrap()[0]
+                .source,
+            "pending"
+        );
+    }
+
+    #[test]
+    fn pending_save_as_new_retry_is_idempotent_after_cleanup_failure() {
+        let notes = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let mut session = connect_session(&notes, &state);
+        session.preserve_pending_native_draft(PendingNativeDraft {
+            base_revision: 0,
+            source: "save this pending input".into(),
+        });
+        let pending_path = session
+            .active
+            .as_ref()
+            .unwrap()
+            .editor
+            .pending_native_draft_path
+            .clone();
+        fs::remove_file(&pending_path).unwrap();
+        fs::create_dir(&pending_path).unwrap();
+        session
+            .folder
+            .as_ref()
+            .unwrap()
+            .folder
+            .index
+            .execute("DROP TABLE note_fts", [])
+            .unwrap();
+        let resolution = PendingDraftResolution::SaveAsNew {
+            operation_id: "pending-save-1".into(),
+            title: Some("Saved pending".into()),
+        };
+        let first = session.resolve_pending_native_draft(resolution.clone());
+        assert!(matches!(
+            first.outcome,
+            OperationOutcome::Rejected(ApplicationProblem {
+                code: ProblemCode::PersistenceFailure,
+                ..
+            })
+        ));
+        assert_eq!(session.folder_ref().unwrap().discover().unwrap().len(), 2);
+
+        fs::remove_dir(&pending_path).unwrap();
+        let second = session.resolve_pending_native_draft(resolution);
+        assert!(matches!(second.outcome, OperationOutcome::Applied(_)));
+        assert_eq!(session.folder_ref().unwrap().discover().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn pending_save_as_new_post_success_retry_returns_same_note() {
+        let notes = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let mut session = connect_session(&notes, &state);
+        session.preserve_pending_native_draft(PendingNativeDraft {
+            base_revision: 0,
+            source: "pending source".into(),
+        });
+        let resolution = PendingDraftResolution::SaveAsNew {
+            operation_id: "pending-post-success".into(),
+            title: Some("Pending copy".into()),
+        };
+        let first = session.resolve_pending_native_draft(resolution.clone());
+        let OperationOutcome::Applied(first) = first.outcome else {
+            panic!("first pending resolution was rejected");
+        };
+        let second = session.resolve_pending_native_draft(resolution.clone());
+        let OperationOutcome::Applied(second) = second.outcome else {
+            panic!("post-success pending retry was rejected");
+        };
+        assert_eq!(second.note.id, first.note.id);
+        assert_eq!(session.folder_ref().unwrap().discover().unwrap().len(), 2);
+
+        session.preserve_pending_native_draft(PendingNativeDraft {
+            base_revision: 0,
+            source: "different pending source".into(),
+        });
+        assert!(matches!(
+            session.resolve_pending_native_draft(resolution).outcome,
+            OperationOutcome::Rejected(_)
+        ));
+        assert_eq!(session.folder_ref().unwrap().discover().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn pending_native_draft_blocks_all_external_note_lifecycle_paths() {
+        let notes = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let note_id = {
+            let mut session = connect_session(&notes, &state);
+            let note_id = session.state().active.unwrap().note_id;
+            session.preserve_pending_native_draft(PendingNativeDraft {
+                base_revision: 0,
+                source: "pending".into(),
+            });
+            note_id
+        };
+        let folder = NoteFolder::open(notes.path(), state.path(), false).unwrap();
+        assert!(matches!(
+            folder.open_editor(note_id.as_str()),
+            Err(AppError::PendingNativeDraft(_))
+        ));
+        assert!(matches!(
+            folder.rename_title(note_id.as_str(), "renamed"),
+            Err(AppError::PendingNativeDraft(_))
+        ));
+        assert!(matches!(
+            folder.move_note(note_id.as_str(), "moved.md"),
+            Err(AppError::PendingNativeDraft(_))
+        ));
+        assert!(matches!(
+            folder.trash(note_id.as_str()),
+            Err(AppError::PendingNativeDraft(_))
+        ));
+        drop(folder);
+        assert!(matches!(
+            NoteFolder::open(notes.path(), state.path(), true),
+            Err(AppError::PendingNativeDraft(_))
+        ));
+        let folder = NoteFolder::open(notes.path(), state.path(), false).unwrap();
+        assert_eq!(folder.pending_native_drafts().unwrap()[0].source, "pending");
+    }
+
+    #[test]
+    fn connect_opens_note_without_recovery_when_another_note_has_one() {
+        let notes = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let recovered_id;
+        let unrelated_id;
+        {
+            let folder = NoteFolder::open(notes.path(), state.path(), false).unwrap();
+            let recovered = folder.create_note(Some("recovered")).unwrap();
+            let unrelated = folder.create_note(Some("unrelated")).unwrap();
+            recovered_id = recovered.id;
+            unrelated_id = unrelated.id;
+            let mut editor = folder.open_editor(recovered_id.as_str()).unwrap();
+            editor
+                .apply(transaction(
+                    0,
+                    "recovered".len(),
+                    "recovered".len(),
+                    " draft",
+                ))
+                .unwrap();
+        }
+
+        let session = connect_session(&notes, &state);
+        let active = session.state().active.unwrap();
+        assert_eq!(active.note_id, unrelated_id);
+        assert!(session
+            .state()
+            .recoveries
+            .iter()
+            .any(|draft| draft.note_id == recovered_id.as_str()));
+    }
+
+    #[test]
+    fn reconciliation_rejects_changed_identity_without_publishing_source() {
+        let notes = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let folder = NoteFolder::open(notes.path(), state.path(), true).unwrap();
+        let note = folder.create_note(Some("body")).unwrap();
+        let mut editor = folder.open_editor(note.id.as_str()).unwrap();
+        let original = editor.snapshot();
+        let changed = set_adopted_id(&original.source, &Ulid::new().to_string());
+        fs::write(notes.path().join(&note.relative_path), changed).unwrap();
+        assert!(matches!(
+            editor.reconcile_external(),
+            Err(AppError::IdentityChanged)
+        ));
+        assert_eq!(editor.snapshot(), original);
+    }
+
+    #[test]
+    fn dirty_external_conflict_preserves_both_sides_and_checks_hash() {
+        let notes = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        fs::write(notes.path().join("note.md"), "base").unwrap();
+        let mut session = connect_session(&notes, &state);
+        session.apply_text_edit(HostTextEdit {
+            expected_revision: 0,
+            replacements: vec![howler_editor::Replacement {
+                range: howler_editor::TextRange::new(4, 4),
+                text: " local".into(),
+            }],
+            selections: Vec::new(),
+            history: howler_editor::HistoryHint::Typing,
+            composition: None,
+        });
+        fs::write(notes.path().join("note.md"), "external").unwrap();
+        let reconciled = session.reconcile_active();
+        let conflict = reconciled
+            .state
+            .active
+            .as_ref()
+            .unwrap()
+            .conflict
+            .clone()
+            .unwrap();
+        assert_eq!(conflict.external_source, "external");
+        assert_eq!(
+            reconciled
+                .state
+                .active
+                .as_ref()
+                .map(|active| active.editor.snapshot.source.as_str()),
+            Some("base local")
+        );
+        let rejected = session.resolve_conflict(ConflictResolution::UseExternal {
+            expected_external_hash: "stale".into(),
+        });
+        assert!(matches!(
+            rejected.outcome,
+            OperationOutcome::Rejected(ApplicationProblem {
+                code: ProblemCode::ContentHashMismatch,
+                ..
+            })
+        ));
+        let resolved = session.resolve_conflict(ConflictResolution::UseExternal {
+            expected_external_hash: conflict.external_hash,
+        });
+        assert!(matches!(resolved.outcome, OperationOutcome::Applied(_)));
+        assert_eq!(
+            resolved.state.active.unwrap().editor.snapshot.source,
+            "external"
+        );
+    }
+
+    #[test]
+    fn conflict_keep_local_retry_is_idempotent_after_cleanup_failure() {
+        let notes = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        fs::write(notes.path().join("note.md"), "base").unwrap();
+        let mut session = connect_session(&notes, &state);
+        session.apply_text_edit(HostTextEdit {
+            expected_revision: 0,
+            replacements: vec![howler_editor::Replacement {
+                range: TextRange::new(4, 4),
+                text: " local".into(),
+            }],
+            selections: Vec::new(),
+            history: howler_editor::HistoryHint::Typing,
+            composition: None,
+        });
+        fs::write(notes.path().join("note.md"), "external").unwrap();
+        let conflict = session
+            .reconcile_active()
+            .state
+            .active
+            .unwrap()
+            .conflict
+            .unwrap();
+        let recovery_path = session
+            .active
+            .as_ref()
+            .unwrap()
+            .editor
+            .recovery_path
+            .clone();
+        fs::remove_file(&recovery_path).unwrap();
+        fs::create_dir(&recovery_path).unwrap();
+        let resolution = ConflictResolution::KeepLocalAsNewNote {
+            operation_id: "conflict-copy-1".into(),
+            expected_external_hash: conflict.external_hash,
+            title: Some("Local copy".into()),
+        };
+        let first = session.resolve_conflict(resolution.clone());
+        assert!(matches!(first.outcome, OperationOutcome::Rejected(_)));
+        assert_eq!(session.folder_ref().unwrap().discover().unwrap().len(), 2);
+        assert_eq!(
+            first.state.active.unwrap().editor.snapshot.source,
+            "base local"
+        );
+
+        fs::remove_dir(&recovery_path).unwrap();
+        let second = session.resolve_conflict(resolution);
+        assert!(matches!(second.outcome, OperationOutcome::Applied(_)));
+        assert_eq!(session.folder_ref().unwrap().discover().unwrap().len(), 2);
+        assert_eq!(
+            second.state.active.unwrap().editor.snapshot.source,
+            "external"
+        );
+    }
+
+    #[test]
+    fn conflict_keep_local_post_success_retry_returns_same_note() {
+        let notes = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        fs::write(notes.path().join("note.md"), "base").unwrap();
+        let mut session = connect_session(&notes, &state);
+        session.apply_text_edit(HostTextEdit {
+            expected_revision: 0,
+            replacements: vec![howler_editor::Replacement {
+                range: TextRange::new(4, 4),
+                text: " local".into(),
+            }],
+            selections: Vec::new(),
+            history: howler_editor::HistoryHint::Typing,
+            composition: None,
+        });
+        fs::write(notes.path().join("note.md"), "external").unwrap();
+        let conflict = session
+            .reconcile_active()
+            .state
+            .active
+            .unwrap()
+            .conflict
+            .unwrap();
+        let resolution = ConflictResolution::KeepLocalAsNewNote {
+            operation_id: "conflict-post-success".into(),
+            expected_external_hash: conflict.external_hash,
+            title: Some("Local copy".into()),
+        };
+        let first = session.resolve_conflict(resolution.clone());
+        let OperationOutcome::Applied(first) = first.outcome else {
+            panic!("first conflict resolution was rejected");
+        };
+        let second_response = session.resolve_conflict(resolution);
+        let active_source = second_response
+            .state
+            .active
+            .as_ref()
+            .unwrap()
+            .editor
+            .snapshot
+            .source
+            .clone();
+        let OperationOutcome::Applied(second) = second_response.outcome else {
+            panic!("post-success conflict retry was rejected");
+        };
+        assert_eq!(second.note.id, first.note.id);
+        assert_eq!(session.folder_ref().unwrap().discover().unwrap().len(), 2);
+        assert_eq!(active_source, "external");
     }
 }

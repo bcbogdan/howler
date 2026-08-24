@@ -17,7 +17,7 @@ cargo test --workspace
 cargo build --workspace
 ```
 
-The standalone `howler-editor` crate has no filesystem or database dependencies. `howler-app` stores canonical content only in Markdown. Pass a device-local state root when opening a folder; its disposable FTS5 index, `state.sqlite3` recency/cursor state, and recovery drafts are created under `folders/<folder-state-id>`.
+The standalone `howler-editor` crate has no filesystem or database dependencies. `howler-app` stores canonical content only in Markdown. Pass a device-local state root when opening a folder; its disposable FTS5 index, `state.sqlite3` recency/cursor state, recovery drafts, and independent pending-native drafts are created under `folders/<folder-state-id>`. Pending-native files are not normal autosave recovery and survive until explicit Rust-owned resolution.
 
 ## CLI
 
@@ -39,7 +39,11 @@ Mutation paths reject symlink components and revalidate immediately before use. 
 
 ## C ABI
 
-Headers are in `ffi/editor/include` and `ffi/application/include`. Handles and returned strings must be released with the matching API's destroy/free function. JSON messages use ABI version 1 semantics; calls are synchronous and handles must be mutated serially.
+Headers are in `ffi/editor/include` and `ffi/application/include`. The folder/editor API remains ABI v1. The partially implemented application-session ABI v2 returns authoritative state, identified effects, and structured domain outcomes; domain rejection still returns transport status `OK`. Session response and boundary strings are caller-owned and must be released with `howler_session_string_free`; v1 strings use `howler_application_string_free`. Callers must synchronize destruction with all use.
+
+V2 calls are currently synchronous, hold the non-blocking session lock for the full operation, and return `BUSY` rather than wait. Search and diagnostics have not yet been moved to split-lock immutable query connections. Cancellable rescan/rebuild and event polling are not exported through v2. Provider-coordinated writes are also deferred, so v2 exposes no native capability table and canonical saves provide in-process per-note serialization and second-hash validation, not a filesystem compare-and-swap. See `docs/adr/ADR-0007-application-session-abi.md` for implemented and deferred scope.
+
+The public v2 JSON operation matrix is `docs/APPLICATION_SESSION_V2_JSON.md`; common state, response, problem, effect, and request structures are checked in at `docs/schema/application-session-v2.schema.json`.
 
 ## macOS
 

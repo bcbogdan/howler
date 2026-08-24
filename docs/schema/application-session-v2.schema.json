@@ -1,0 +1,664 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://howler.local/schema/application-session-v2.schema.json",
+  "title": "Howler application-session ABI v2 JSON contract",
+  "$ref": "#/$defs/applicationResponse",
+  "$defs": {
+    "identity": {
+      "type": "object",
+      "properties": {
+        "kind": { "enum": ["adopted", "provisional"] },
+        "value": { "type": "string" }
+      },
+      "required": ["kind", "value"],
+      "additionalProperties": true
+    },
+    "noteSummary": {
+      "type": "object",
+      "properties": {
+        "id": { "$ref": "#/$defs/identity" },
+        "relative_path": { "type": "string" },
+        "title": { "type": "string" },
+        "content_hash": { "type": "string" }
+      },
+      "required": ["id", "relative_path", "title", "content_hash"],
+      "additionalProperties": true
+    },
+    "connectResult": {
+      "type": "object",
+      "properties": {
+        "opened_note": { "oneOf": [{ "$ref": "#/$defs/noteSummary" }, { "type": "null" }] }
+      },
+      "required": ["opened_note"],
+      "additionalProperties": true
+    },
+    "noteResult": {
+      "type": "object",
+      "properties": { "note": { "$ref": "#/$defs/noteSummary" } },
+      "required": ["note"],
+      "additionalProperties": true
+    },
+    "trashResult": {
+      "type": "object",
+      "properties": { "trash_path": { "type": "string" } },
+      "required": ["trash_path"],
+      "additionalProperties": true
+    },
+    "textRange": {
+      "type": "object",
+      "properties": {
+        "start": { "type": "integer", "minimum": 0 },
+        "end": { "type": "integer", "minimum": 0 }
+      },
+      "required": ["start", "end"],
+      "additionalProperties": true
+    },
+    "selection": {
+      "type": "object",
+      "properties": {
+        "anchor": { "type": "integer", "minimum": 0 },
+        "head": { "type": "integer", "minimum": 0 },
+        "affinity": { "enum": ["Upstream", "Downstream"] },
+        "revision": { "type": "integer", "minimum": 0 }
+      },
+      "required": ["anchor", "head", "affinity", "revision"],
+      "additionalProperties": true
+    },
+    "snapshot": {
+      "type": "object",
+      "properties": {
+        "revision": { "type": "integer", "minimum": 0 },
+        "source": { "type": "string" },
+        "selections": { "type": "array", "items": { "$ref": "#/$defs/selection" } },
+        "can_undo": { "type": "boolean" },
+        "can_redo": { "type": "boolean" }
+      },
+      "required": ["revision", "source", "selections", "can_undo", "can_redo"],
+      "additionalProperties": true
+    },
+    "decoration": {
+      "type": "object",
+      "properties": {
+        "range": { "$ref": "#/$defs/textRange" },
+        "kind": {
+          "oneOf": [
+            { "enum": ["Emphasis", "Strong", "Link", "Code", "ListItem"] },
+            {
+              "type": "object",
+              "properties": { "Heading": { "type": "integer", "minimum": 1, "maximum": 6 } },
+              "required": ["Heading"],
+              "additionalProperties": true
+            },
+            {
+              "type": "object",
+              "properties": { "Checkbox": { "type": "boolean" } },
+              "required": ["Checkbox"],
+              "additionalProperties": true
+            }
+          ]
+        }
+      },
+      "required": ["range", "kind"],
+      "additionalProperties": true
+    },
+    "editResult": {
+      "type": "object",
+      "properties": {
+        "revision": { "type": "integer", "minimum": 0 },
+        "changed_ranges": { "type": "array", "items": { "$ref": "#/$defs/textRange" } },
+        "selections": { "type": "array", "items": { "$ref": "#/$defs/selection" } },
+        "decorations": { "type": "array", "items": { "$ref": "#/$defs/decoration" } }
+      },
+      "required": ["revision", "changed_ranges", "selections", "decorations"],
+      "additionalProperties": true
+    },
+    "saveOutcome": {
+      "type": "object",
+      "properties": {
+        "revision": { "type": "integer", "minimum": 0 },
+        "durability": { "enum": ["accepted", "recovery_durable", "file_saved"] },
+        "recovery_cleanup": { "enum": ["removed", "already_absent", "retained"] },
+        "recovery_cleanup_error": { "type": ["string", "null"] },
+        "index_state": { "enum": ["current", "stale"] },
+        "index_error": { "type": ["string", "null"] },
+        "recency_error": { "type": ["string", "null"] },
+        "canonical_error": { "type": ["string", "null"] }
+      },
+      "required": [
+        "revision", "durability", "recovery_cleanup", "recovery_cleanup_error", "index_state",
+        "index_error", "recency_error", "canonical_error"
+      ],
+      "additionalProperties": true
+    },
+    "saveResult": {
+      "type": "object",
+      "properties": { "save": { "$ref": "#/$defs/saveOutcome" } },
+      "required": ["save"],
+      "additionalProperties": true
+    },
+    "reconcileResult": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": { "status": { "const": "unchanged" } },
+          "required": ["status"],
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "properties": {
+            "status": { "const": "refreshed" },
+            "revision": { "type": "integer", "minimum": 0 }
+          },
+          "required": ["status", "revision"],
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "properties": {
+            "status": { "const": "conflict" },
+            "external_source": { "type": "string" }
+          },
+          "required": ["status", "external_source"],
+          "additionalProperties": true
+        }
+      ]
+    },
+    "searchResult": {
+      "type": "object",
+      "properties": {
+        "note": { "$ref": "#/$defs/noteSummary" },
+        "snippet": { "type": "string" },
+        "reason": { "enum": ["exact_title", "prefix_title", "fuzzy_title", "body", "recent"] }
+      },
+      "required": ["note", "snippet", "reason"],
+      "additionalProperties": true
+    },
+    "diagnostic": {
+      "type": "object",
+      "properties": {
+        "severity": { "type": "string" },
+        "code": { "type": "string" },
+        "relative_path": { "type": ["string", "null"] },
+        "message": { "type": "string" }
+      },
+      "required": ["severity", "code", "relative_path", "message"],
+      "additionalProperties": true
+    },
+    "diagnosticBundle": {
+      "type": "object",
+      "properties": {
+        "application_version": { "type": "string" },
+        "editor_version": { "type": "string" },
+        "index_schema": { "type": "integer", "minimum": 0 },
+        "state_schema": { "type": "integer", "minimum": 0 },
+        "adopted": { "type": "boolean" },
+        "note_count": { "type": "integer", "minimum": 0 },
+        "recovery_count": { "type": "integer", "minimum": 0 },
+        "diagnostics": { "type": "array", "items": { "$ref": "#/$defs/diagnostic" } }
+      },
+      "required": [
+        "application_version", "editor_version", "index_schema", "state_schema", "adopted",
+        "note_count", "recovery_count", "diagnostics"
+      ],
+      "additionalProperties": true
+    },
+    "appliedValue": {
+      "anyOf": [
+        { "type": "null" },
+        { "$ref": "#/$defs/connectResult" },
+        { "$ref": "#/$defs/noteResult" },
+        { "$ref": "#/$defs/trashResult" },
+        { "$ref": "#/$defs/editResult" },
+        { "$ref": "#/$defs/saveResult" },
+        { "$ref": "#/$defs/reconcileResult" },
+        { "type": "array", "items": { "$ref": "#/$defs/searchResult" } },
+        { "type": "array", "items": { "$ref": "#/$defs/diagnostic" } },
+        { "$ref": "#/$defs/diagnosticBundle" }
+      ]
+    },
+    "persistenceIssue": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "enum": [
+            "recovery_write", "canonical_write", "canonical_durability_uncertain",
+            "recovery_cleanup", "index_stale", "recency_update"
+          ]
+        },
+        "diagnostic": { "type": "string" }
+      },
+      "required": ["kind", "diagnostic"],
+      "additionalProperties": true
+    },
+    "persistenceState": {
+      "type": "object",
+      "properties": {
+        "durability": { "enum": ["accepted", "recovery_durable", "file_saved"] },
+        "replacement_safety": { "enum": ["safe", "must_retain_editor"] },
+        "issues": { "type": "array", "items": { "$ref": "#/$defs/persistenceIssue" } }
+      },
+      "required": ["durability", "replacement_safety", "issues"],
+      "additionalProperties": true
+    },
+    "pendingNativeDraftState": {
+      "type": "object",
+      "properties": {
+        "base_revision": { "type": "integer", "minimum": 0 },
+        "source": { "type": "string" },
+        "durable": { "type": "boolean" }
+      },
+      "required": ["base_revision", "source", "durable"],
+      "additionalProperties": true
+    },
+    "activeEditorState": {
+      "type": "object",
+      "properties": {
+        "note_id": { "$ref": "#/$defs/identity" },
+        "editor": {
+          "type": "object",
+          "properties": {
+            "snapshot": { "$ref": "#/$defs/snapshot" },
+            "decorations": {
+              "type": "object",
+              "properties": {
+                "revision": { "type": "integer", "minimum": 0 },
+                "items": { "type": "array", "items": { "$ref": "#/$defs/decoration" } }
+              },
+              "required": ["revision", "items"],
+              "additionalProperties": true
+            }
+          },
+          "required": ["snapshot", "decorations"],
+          "additionalProperties": true
+        },
+        "persistence": { "$ref": "#/$defs/persistenceState" },
+        "conflict": {
+          "type": ["object", "null"],
+          "properties": {
+            "external_source": { "type": "string" },
+            "external_hash": { "type": "string" }
+          },
+          "required": ["external_source", "external_hash"],
+          "additionalProperties": true
+        },
+        "pending_native_draft": { "oneOf": [{ "$ref": "#/$defs/pendingNativeDraftState" }, { "type": "null" }] },
+        "generation": { "type": "integer", "minimum": 0 }
+      },
+      "required": ["note_id", "editor", "persistence", "conflict", "pending_native_draft", "generation"],
+      "additionalProperties": true
+    },
+    "applicationState": {
+      "type": "object",
+      "properties": {
+        "folder": {
+          "type": ["object", "null"],
+          "properties": {
+            "path": { "type": "string" },
+            "adopted": { "type": "boolean" },
+            "generation": { "type": "integer", "minimum": 0 }
+          },
+          "required": ["path", "adopted", "generation"],
+          "additionalProperties": true
+        },
+        "active": { "oneOf": [{ "$ref": "#/$defs/activeEditorState" }, { "type": "null" }] },
+        "recoveries": { "type": "array", "items": { "$ref": "#/$defs/recoveryDraft" } },
+        "background_tasks": { "type": "array", "maxItems": 0 }
+      },
+      "required": ["folder", "active", "recoveries", "background_tasks"],
+      "additionalProperties": true
+    },
+    "recoveryDraft": {
+      "type": "object",
+      "properties": {
+        "note_id": { "type": "string" },
+        "relative_path": { "type": "string" },
+        "revision": { "type": "integer", "minimum": 0 },
+        "base_hash": { "type": "string" },
+        "source": { "type": "string" }
+      },
+      "required": ["note_id", "relative_path", "revision", "base_hash", "source"],
+      "additionalProperties": true
+    },
+    "problemDetails": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "properties": {
+            "kind": { "const": "stale_revision" },
+            "expected_revision": { "type": "integer", "minimum": 0 },
+            "current_revision": { "type": "integer", "minimum": 0 }
+          },
+          "required": ["kind", "expected_revision", "current_revision"],
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": { "const": "external_conflict" },
+            "external_source": { "type": "string" },
+            "external_hash": { "type": "string" }
+          },
+          "required": ["kind", "external_source", "external_hash"],
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": { "const": "recovery_pending" },
+            "note_id": { "$ref": "#/$defs/identity" }
+          },
+          "required": ["kind", "note_id"],
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": { "const": "persistence" },
+            "issues": { "type": "array", "items": { "$ref": "#/$defs/persistenceIssue" } }
+          },
+          "required": ["kind", "issues"],
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": { "const": "content_hash_mismatch" },
+            "expected_hash": { "type": "string" },
+            "current_hash": { "type": "string" }
+          },
+          "required": ["kind", "expected_hash", "current_hash"],
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": { "const": "adoption_required" },
+            "folder_path": { "type": "string" }
+          },
+          "required": ["kind", "folder_path"],
+          "additionalProperties": true
+        }
+      ]
+    },
+    "problem": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "enum": [
+            "not_connected", "note_not_found", "recovery_not_found", "recovery_pending",
+            "stale_revision", "external_conflict", "identity_changed", "stale_editor",
+            "wrong_owner", "destination_exists", "duplicate_identity", "invalid_operation",
+            "persistence_failure", "task_not_found", "content_hash_mismatch",
+            "adoption_required", "database_failure"
+          ]
+        },
+        "diagnostic": { "type": "string" },
+        "details": { "$ref": "#/$defs/problemDetails" }
+      },
+      "required": ["code", "diagnostic", "details"],
+      "additionalProperties": true
+    },
+    "hostEffect": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": { "const": "schedule_autosave" },
+            "effect_id": { "type": "string" },
+            "delay_ms": { "type": "integer", "minimum": 0 },
+            "target": { "$ref": "#/$defs/saveTarget" }
+          },
+          "required": ["kind", "effect_id", "delay_ms", "target"],
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": { "const": "cancel_effect" },
+            "effect_id": { "type": "string" }
+          },
+          "required": ["kind", "effect_id"],
+          "additionalProperties": true
+        }
+      ]
+    },
+    "applicationResponse": {
+      "type": "object",
+      "properties": {
+        "state": { "$ref": "#/$defs/applicationState" },
+        "effects": { "type": "array", "items": { "$ref": "#/$defs/hostEffect" } },
+        "outcome": {
+          "oneOf": [
+            {
+              "type": "object",
+              "properties": {
+                "status": { "const": "applied" },
+                "value": { "$ref": "#/$defs/appliedValue" }
+              },
+              "required": ["status", "value"],
+              "additionalProperties": true
+            },
+            {
+              "type": "object",
+              "properties": { "status": { "const": "rejected" }, "value": { "$ref": "#/$defs/problem" } },
+              "required": ["status", "value"],
+              "additionalProperties": true
+            }
+          ]
+        }
+      },
+      "required": ["state", "effects", "outcome"],
+      "additionalProperties": true
+    },
+    "connectRequest": {
+      "type": "object",
+      "properties": {
+        "folder_path": { "type": "string" },
+        "application_state_path": { "type": "string" },
+        "adopt": { "type": "boolean", "default": false },
+        "create_missing": { "type": "boolean", "default": false }
+      },
+      "required": ["folder_path", "application_state_path"],
+      "additionalProperties": true
+    },
+    "createNoteRequest": {
+      "type": "object",
+      "properties": { "source": { "type": ["string", "null"] } },
+      "additionalProperties": true
+    },
+    "hostTextEdit": {
+      "type": "object",
+      "properties": {
+        "expected_revision": { "type": "integer", "minimum": 0 },
+        "replacements": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": { "range": { "$ref": "#/$defs/textRange" }, "text": { "type": "string" } },
+            "required": ["range", "text"],
+            "additionalProperties": true
+          }
+        },
+        "selections": { "type": "array", "items": { "$ref": "#/$defs/selection" } },
+        "history": { "enum": ["Typing", "Paste", "Formatting", "Isolated"] },
+        "composition": {
+          "oneOf": [
+            {
+              "type": "object",
+              "properties": {
+                "original_range": { "$ref": "#/$defs/textRange" },
+                "original_text": { "type": "string" }
+              },
+              "required": ["original_range", "original_text"],
+              "additionalProperties": true
+            },
+            { "type": "null" }
+          ]
+        }
+      },
+      "required": ["expected_revision", "replacements", "selections", "history"],
+      "additionalProperties": true
+    },
+    "editorCommand": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "Bold": {
+              "type": "object",
+              "properties": { "range": { "$ref": "#/$defs/textRange" } },
+              "required": ["range"],
+              "additionalProperties": true
+            }
+          },
+          "required": ["Bold"],
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "properties": {
+            "Emphasis": {
+              "type": "object",
+              "properties": { "range": { "$ref": "#/$defs/textRange" } },
+              "required": ["range"],
+              "additionalProperties": true
+            }
+          },
+          "required": ["Emphasis"],
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "properties": {
+            "Link": {
+              "type": "object",
+              "properties": { "range": { "$ref": "#/$defs/textRange" }, "url": { "type": "string" } },
+              "required": ["range", "url"],
+              "additionalProperties": true
+            }
+          },
+          "required": ["Link"],
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "properties": {
+            "UnorderedList": {
+              "type": "object",
+              "properties": { "range": { "$ref": "#/$defs/textRange" } },
+              "required": ["range"],
+              "additionalProperties": true
+            }
+          },
+          "required": ["UnorderedList"],
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "properties": {
+            "Checkbox": {
+              "type": "object",
+              "properties": { "range": { "$ref": "#/$defs/textRange" } },
+              "required": ["range"],
+              "additionalProperties": true
+            }
+          },
+          "required": ["Checkbox"],
+          "additionalProperties": true
+        }
+      ]
+    },
+    "pendingNativeDraft": {
+      "type": "object",
+      "properties": {
+        "base_revision": { "type": "integer", "minimum": 0 },
+        "source": { "type": "string" }
+      },
+      "required": ["base_revision", "source"],
+      "additionalProperties": true
+    },
+    "pendingDraftResolution": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "resolution": { "const": "save_as_new" },
+            "operation_id": { "type": "string", "pattern": "^[A-Za-z0-9._-]{1,128}$" },
+            "title": { "type": ["string", "null"] }
+          },
+          "required": ["resolution", "operation_id"],
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "properties": { "resolution": { "const": "discard" } },
+          "required": ["resolution"],
+          "additionalProperties": true
+        }
+      ]
+    },
+    "saveTarget": {
+      "type": "object",
+      "properties": {
+        "note_id": { "$ref": "#/$defs/identity" },
+        "revision": { "type": "integer", "minimum": 0 },
+        "generation": { "type": "integer", "minimum": 0 }
+      },
+      "required": ["note_id", "revision", "generation"],
+      "additionalProperties": true
+    },
+    "conflictResolution": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "resolution": { "const": "use_external" },
+            "expected_external_hash": { "type": "string" }
+          },
+          "required": ["resolution", "expected_external_hash"],
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "properties": {
+            "resolution": { "const": "keep_local_as_new_note" },
+            "operation_id": { "type": "string", "pattern": "^[A-Za-z0-9._-]{1,128}$" },
+            "expected_external_hash": { "type": "string" },
+            "title": { "type": ["string", "null"] }
+          },
+          "required": ["resolution", "operation_id", "expected_external_hash"],
+          "additionalProperties": true
+        }
+      ]
+    },
+    "searchQuery": {
+      "type": "object",
+      "properties": {
+        "query": { "type": "string" },
+        "limit": { "type": "integer", "minimum": 0, "default": 40 }
+      },
+      "required": ["query"],
+      "additionalProperties": true
+    },
+    "renameNoteRequest": {
+      "type": "object",
+      "properties": { "note_id": { "type": "string" }, "title": { "type": "string" } },
+      "required": ["note_id", "title"],
+      "additionalProperties": true
+    },
+    "moveNoteRequest": {
+      "type": "object",
+      "properties": { "note_id": { "type": "string" }, "destination": { "type": "string" } },
+      "required": ["note_id", "destination"],
+      "additionalProperties": true
+    },
+    "restoreNoteRequest": {
+      "type": "object",
+      "properties": { "trash_path": { "type": "string" } },
+      "required": ["trash_path"],
+      "additionalProperties": true
+    }
+  }
+}

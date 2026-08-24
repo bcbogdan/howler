@@ -7,6 +7,7 @@ extern "C" {
 #endif
 
 #define HOWLER_APPLICATION_ABI_VERSION 1
+#define HOWLER_SESSION_ABI_VERSION 2
 #define HOWLER_APPLICATION_OK 0
 #define HOWLER_APPLICATION_INVALID_ARGUMENT 1
 #define HOWLER_APPLICATION_STALE_REVISION 2
@@ -21,6 +22,70 @@ extern "C" {
 
 typedef struct HowlerNoteFolder HowlerNoteFolder;
 typedef struct HowlerNoteEditor HowlerNoteEditor;
+typedef struct HowlerApplicationSession HowlerApplicationSession;
+
+/* Application-session ABI v2 is partially implemented as documented by ADR-0007.
+ *
+ * Functions whose names end in _json are synchronous and hold the session lock for their full
+ * execution. Lock acquisition does not wait. Only these transport statuses are returned by v2:
+ * HOWLER_APPLICATION_OK, HOWLER_APPLICATION_INVALID_ARGUMENT, HOWLER_APPLICATION_BUSY, and
+ * HOWLER_APPLICATION_INTERNAL. Other HOWLER_APPLICATION_* statuses are v1-only.
+ *
+ * On a valid _json call, HOWLER_APPLICATION_OK means out_response_json contains one UTF-8 JSON
+ * ApplicationResponse: {"state":...,"effects":[],"outcome":{"status":"applied|rejected",
+ * "value":...}}. Domain rejection is transport success and includes authoritative state.
+ * howler_session_state_json uses this envelope with null applied data. Version queries, create,
+ * destroy, and free do not return ApplicationResponse.
+ *
+ * A NULL session returns INVALID_ARGUMENT. Passing any non-NULL pointer that is not a live session
+ * returned by howler_session_create, including a destroyed handle, violates the caller contract and
+ * has undefined behavior. A NULL required input or output slot returns INVALID_ARGUMENT. Invalid
+ * UTF-8 and malformed JSON also return INVALID_ARGUMENT. Contention returns BUSY. A poisoned lock
+ * or response serialization failure returns INTERNAL.
+ *
+ * Both required output slots are initialized to NULL before other validation when the slots
+ * themselves are non-NULL. Transport failure leaves out_response_json NULL and, when allocation is
+ * possible, returns a boundary problem through out_boundary_problem_json. Every non-NULL returned
+ * response or boundary string is a distinct Rust allocation owned exclusively by the caller until
+ * freed exactly once with howler_session_string_free; it must not be modified, passed to another
+ * allocator, or used after free. Input strings and JSON are borrowed only for the duration of the
+ * call and must remain valid NUL-terminated UTF-8 until it returns. The session is caller-owned from
+ * successful create until one synchronized destroy; destroy(NULL) is a no-op. The caller must ensure
+ * no call can overlap destruction.
+ *
+ * Search and diagnostics currently hold the session lock. Cancellable rescan/rebuild and provider
+ * coordinated writes are deferred and are not exposed by this v2 header. No filesystem
+ * compare-and-swap or native coordination capability is claimed. */
+uint32_t howler_session_abi_version(void);
+int32_t howler_session_create(HowlerApplicationSession **out_session);
+void howler_session_destroy(HowlerApplicationSession *session);
+int32_t howler_session_state_json(HowlerApplicationSession *session, char **out_response_json, char **out_boundary_problem_json);
+int32_t howler_session_connect_json(HowlerApplicationSession *session, const char *request_json, char **out_response_json, char **out_boundary_problem_json);
+int32_t howler_session_adopt_folder_json(HowlerApplicationSession *session, char **out_response_json, char **out_boundary_problem_json);
+int32_t howler_session_create_note_json(HowlerApplicationSession *session, const char *request_json, char **out_response_json, char **out_boundary_problem_json);
+int32_t howler_session_open_note_json(HowlerApplicationSession *session, const char *note_id, char **out_response_json, char **out_boundary_problem_json);
+int32_t howler_session_close_note_json(HowlerApplicationSession *session, char **out_response_json, char **out_boundary_problem_json);
+int32_t howler_session_apply_text_edit_json(HowlerApplicationSession *session, const char *edit_json, char **out_response_json, char **out_boundary_problem_json);
+int32_t howler_session_preserve_pending_native_draft_json(HowlerApplicationSession *session, const char *draft_json, char **out_response_json, char **out_boundary_problem_json);
+/* Pending-native storage is independent from normal recovery/autosave. An unresolved pending draft
+ * always reports must_retain_editor and must be explicitly resolved before editor replacement. */
+int32_t howler_session_resolve_pending_native_draft_json(HowlerApplicationSession *session, const char *resolution_json, char **out_response_json, char **out_boundary_problem_json);
+int32_t howler_session_execute_command_json(HowlerApplicationSession *session, uint64_t expected_revision, const char *command_json, char **out_response_json, char **out_boundary_problem_json);
+int32_t howler_session_undo_json(HowlerApplicationSession *session, uint64_t expected_revision, char **out_response_json, char **out_boundary_problem_json);
+int32_t howler_session_redo_json(HowlerApplicationSession *session, uint64_t expected_revision, char **out_response_json, char **out_boundary_problem_json);
+int32_t howler_session_save_json(HowlerApplicationSession *session, const char *target_json, char **out_response_json, char **out_boundary_problem_json);
+int32_t howler_session_resolve_conflict_json(HowlerApplicationSession *session, const char *resolution_json, char **out_response_json, char **out_boundary_problem_json);
+int32_t howler_session_restore_recovery_json(HowlerApplicationSession *session, const char *note_id, char **out_response_json, char **out_boundary_problem_json);
+int32_t howler_session_discard_recovery_json(HowlerApplicationSession *session, const char *note_id, char **out_response_json, char **out_boundary_problem_json);
+int32_t howler_session_reconcile_active_json(HowlerApplicationSession *session, char **out_response_json, char **out_boundary_problem_json);
+int32_t howler_session_search_json(HowlerApplicationSession *session, const char *query_json, char **out_response_json, char **out_boundary_problem_json);
+int32_t howler_session_rename_note_json(HowlerApplicationSession *session, const char *request_json, char **out_response_json, char **out_boundary_problem_json);
+int32_t howler_session_move_note_json(HowlerApplicationSession *session, const char *request_json, char **out_response_json, char **out_boundary_problem_json);
+int32_t howler_session_trash_note_json(HowlerApplicationSession *session, const char *note_id, char **out_response_json, char **out_boundary_problem_json);
+int32_t howler_session_restore_note_json(HowlerApplicationSession *session, const char *request_json, char **out_response_json, char **out_boundary_problem_json);
+int32_t howler_session_diagnostics_json(HowlerApplicationSession *session, char **out_response_json, char **out_boundary_problem_json);
+int32_t howler_session_diagnostic_bundle_json(HowlerApplicationSession *session, char **out_response_json, char **out_boundary_problem_json);
+void howler_session_string_free(char *string);
 
 /* Calls are synchronous and use non-blocking per-handle locks; concurrent use returns BUSY. The
  * caller must synchronize destruction with all use. error_message returns borrowed static storage.

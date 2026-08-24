@@ -6,8 +6,14 @@ let package = Package(
     platforms: [.macOS(.v13)],
     products: [.executable(name: "HowlerMac", targets: ["HowlerMac"])],
     targets: [
+        .target(
+            name: "CHowlerApplication",
+            path: "Sources/CHowlerApplication",
+            publicHeadersPath: "include"
+        ),
         .executableTarget(
             name: "HowlerMac",
+            dependencies: ["CHowlerApplication"],
             path: "Sources/HowlerMac",
             linkerSettings: [
                 .unsafeFlags(
