@@ -25,12 +25,12 @@ losing model state. Parse failures keep the last good view.
 
 ## Native SDK pin
 
-`build.zig.zon` points the `native_sdk` dependency at:
+`build.zig.zon` pins the `native_sdk` dependency to:
 
 ```text
-../../../../../../tmp/opencode/howler-native-sdk
+https://github.com/bcbogdan/native/commit/fe1c27994c2948fc0b9faf84c2222f7d5981621b
 ```
 
-The local path is temporary. It contains controlled-editor commit `e6a9b595`
-and macOS window-behavior commit `8a5d711e`. Push the fork, then replace this
-path with an exact remote URL and package hash; do not point Howler at a branch.
+The Zig package hash is
+`native_sdk-0.1.0-hzDzQu5IsQLrHwJDFjYxbPaqJiCe4Ai4DwHbFL-NAFUp`. Keep both
+the commit and package hash exact; do not point Howler at a branch.

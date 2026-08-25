@@ -47,4 +47,4 @@ The public v2 JSON operation matrix is `docs/APPLICATION_SESSION_V2_JSON.md`; co
 
 ## Native app
 
-The Native SDK migration host is under `apps/native`. Build the Rust application ABI with `cargo build -p howler-application-ffi`, then run `zig build` or `zig build test` from `apps/native` using Zig 0.16.0. The SDK dependency temporarily points at the local fork checkout until commit `e6a9b595` is pushed to an accessible remote; after that it must be replaced by an exact URL and package hash. macOS packaging and runtime acceptance remain migration gates.
+The Native SDK migration host is under `apps/native`. Build the Rust application ABI with `cargo build -p howler-application-ffi`, then run `zig build` or `zig build test` from `apps/native` using Zig 0.16.0. The SDK dependency pins exact fork commit `fe1c27994c2948fc0b9faf84c2222f7d5981621b` and its Zig package hash. macOS packaging and runtime acceptance remain migration gates.

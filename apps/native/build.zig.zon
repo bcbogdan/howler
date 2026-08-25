@@ -3,6 +3,11 @@
     .fingerprint = 0xc0881db75a707070,
     .version = "0.1.0",
     .minimum_zig_version = "0.16.0",
-    .dependencies = .{ .native_sdk = .{ .path = "../../../../../../tmp/opencode/howler-native-sdk" } },
+    .dependencies = .{
+        .native_sdk = .{
+            .url = "git+https://github.com/bcbogdan/native.git#fe1c27994c2948fc0b9faf84c2222f7d5981621b",
+            .hash = "native_sdk-0.1.0-hzDzQu5IsQLrHwJDFjYxbPaqJiCe4Ai4DwHbFL-NAFUp",
+        },
+    },
     .paths = .{ "build.zig", "build.zig.zon", "src", "assets", "app.json", "README.md" },
 }
