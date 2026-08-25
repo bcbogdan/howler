@@ -1,0 +1,9 @@
+{
+  "revision": 2,
+  "source": "a😀",
+  "selections": [
+    { "anchor": 5, "head": 5, "affinity": "Downstream", "revision": 2 }
+  ],
+  "can_undo": true,
+  "can_redo": false
+}

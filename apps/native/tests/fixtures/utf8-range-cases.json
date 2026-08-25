@@ -1,0 +1,46 @@
+{
+  "utf16_to_utf8": [
+    {
+      "source": "a😀éאב",
+      "utf16": { "location": 1, "length": 2 },
+      "utf8": { "start": 1, "end": 5 }
+    }
+  ],
+  "normalized_selections": [
+    {
+      "source": "a😀b",
+      "anchor": 5,
+      "head": 1,
+      "utf16": { "location": 1, "length": 2 }
+    }
+  ],
+  "direction_preservation": [
+    {
+      "native_utf8": { "start": 1, "end": 5 },
+      "previous": { "anchor": 5, "head": 1, "affinity": "Upstream", "revision": 2 },
+      "expected": { "anchor": 5, "head": 1, "affinity": "Upstream", "revision": 3 }
+    },
+    {
+      "native_utf8": { "start": 1, "end": 7 },
+      "previous": { "anchor": 1, "head": 5, "affinity": "Downstream", "revision": 2 },
+      "expected": { "anchor": 1, "head": 7, "affinity": "Downstream", "revision": 2 }
+    },
+    {
+      "native_utf8": { "start": 0, "end": 5 },
+      "previous": { "anchor": 5, "head": 1, "affinity": "Upstream", "revision": 2 },
+      "expected": { "anchor": 5, "head": 0, "affinity": "Upstream", "revision": 2 }
+    }
+  ],
+  "presentation_context_changes": [
+    {
+      "previous": { "note_id": "first", "generation": 4, "revision": 2, "presents_pending_draft": false },
+      "next": { "note_id": "second", "generation": 5, "revision": 2, "presents_pending_draft": false },
+      "requires_authoritative_selection": true
+    },
+    {
+      "previous": { "note_id": "note", "generation": 7, "revision": 3, "presents_pending_draft": false },
+      "next": { "note_id": "note", "generation": 7, "revision": 3, "presents_pending_draft": true },
+      "requires_authoritative_selection": true
+    }
+  ]
+}

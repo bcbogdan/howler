@@ -1,0 +1,12 @@
+[
+  {
+    "note": {
+      "id": { "kind": "provisional", "value": "id" },
+      "relative_path": "note.md",
+      "title": "Note",
+      "content_hash": "hash"
+    },
+    "snippet": "body",
+    "reason": "fuzzy_title"
+  }
+]

@@ -1,6 +1,4 @@
 /target
-/.build
-/apps/macos/.build
 DerivedData/
 *.xcuserstate
 xcuserdata/

@@ -60,12 +60,14 @@ uint32_t howler_session_abi_version(void);
 int32_t howler_session_create(HowlerApplicationSession **out_session);
 void howler_session_destroy(HowlerApplicationSession *session);
 int32_t howler_session_state_json(HowlerApplicationSession *session, char **out_response_json, char **out_boundary_problem_json);
+int32_t howler_session_capabilities_json(HowlerApplicationSession *session, char **out_response_json, char **out_boundary_problem_json);
 int32_t howler_session_connect_json(HowlerApplicationSession *session, const char *request_json, char **out_response_json, char **out_boundary_problem_json);
 int32_t howler_session_adopt_folder_json(HowlerApplicationSession *session, char **out_response_json, char **out_boundary_problem_json);
 int32_t howler_session_create_note_json(HowlerApplicationSession *session, const char *request_json, char **out_response_json, char **out_boundary_problem_json);
 int32_t howler_session_open_note_json(HowlerApplicationSession *session, const char *note_id, char **out_response_json, char **out_boundary_problem_json);
 int32_t howler_session_close_note_json(HowlerApplicationSession *session, char **out_response_json, char **out_boundary_problem_json);
 int32_t howler_session_apply_text_edit_json(HowlerApplicationSession *session, const char *edit_json, char **out_response_json, char **out_boundary_problem_json);
+int32_t howler_session_apply_selection_json(HowlerApplicationSession *session, const char *selection_json, char **out_response_json, char **out_boundary_problem_json);
 int32_t howler_session_preserve_pending_native_draft_json(HowlerApplicationSession *session, const char *draft_json, char **out_response_json, char **out_boundary_problem_json);
 /* Pending-native storage is independent from normal recovery/autosave. An unresolved pending draft
  * always reports must_retain_editor and must be explicitly resolved before editor replacement. */

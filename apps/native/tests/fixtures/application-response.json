@@ -1,0 +1,21 @@
+{
+  "state": {
+    "folder": { "path": "/notes", "adopted": false, "generation": 3 },
+    "active": null,
+    "recoveries": [],
+    "background_tasks": []
+  },
+  "effects": [
+    {
+      "kind": "schedule_autosave",
+      "effect_id": "autosave-1",
+      "delay_ms": 750,
+      "target": {
+        "note_id": { "kind": "provisional", "value": "id" },
+        "revision": 2,
+        "generation": 3
+      }
+    }
+  ],
+  "outcome": { "status": "applied", "value": { "opened_note": null } }
+}

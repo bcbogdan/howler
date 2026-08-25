@@ -112,6 +112,30 @@
       "required": ["revision", "changed_ranges", "selections", "decorations"],
       "additionalProperties": true
     },
+    "selectionResult": {
+      "type": "object",
+      "properties": {
+        "revision": { "type": "integer", "minimum": 0 },
+        "selections": { "type": "array", "items": { "$ref": "#/$defs/selection" } }
+      },
+      "required": ["revision", "selections"],
+      "additionalProperties": true
+    },
+    "sessionCapabilities": {
+      "type": "object",
+      "properties": {
+        "application_session_abi": { "const": 2 },
+        "selection_updates": { "type": "boolean" },
+        "input_origin_metadata": { "type": "boolean" },
+        "rust_owned_history": { "type": "boolean" },
+        "pending_native_drafts": { "type": "boolean" }
+      },
+      "required": [
+        "application_session_abi", "selection_updates", "input_origin_metadata",
+        "rust_owned_history", "pending_native_drafts"
+      ],
+      "additionalProperties": true
+    },
     "saveOutcome": {
       "type": "object",
       "properties": {
@@ -210,6 +234,8 @@
         { "$ref": "#/$defs/noteResult" },
         { "$ref": "#/$defs/trashResult" },
         { "$ref": "#/$defs/editResult" },
+        { "$ref": "#/$defs/selectionResult" },
+        { "$ref": "#/$defs/sessionCapabilities" },
         { "$ref": "#/$defs/saveResult" },
         { "$ref": "#/$defs/reconcileResult" },
         { "type": "array", "items": { "$ref": "#/$defs/searchResult" } },
@@ -496,9 +522,24 @@
             },
             { "type": "null" }
           ]
+        },
+        "input_origin": {
+          "oneOf": [
+            { "enum": ["typing", "paste", "composition", "dictation", "autocorrection", "replacement"] },
+            { "type": "null" }
+          ]
         }
       },
       "required": ["expected_revision", "replacements", "selections", "history"],
+      "additionalProperties": true
+    },
+    "hostSelectionUpdate": {
+      "type": "object",
+      "properties": {
+        "expected_revision": { "type": "integer", "minimum": 0 },
+        "selections": { "type": "array", "items": { "$ref": "#/$defs/selection" } }
+      },
+      "required": ["expected_revision", "selections"],
       "additionalProperties": true
     },
     "editorCommand": {

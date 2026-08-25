@@ -1686,6 +1686,17 @@ impl NoteEditor {
         self.accepted(Some(result))
     }
 
+    pub fn set_selections(
+        &mut self,
+        expected_revision: u64,
+        selections: Vec<howler_editor::Selection>,
+    ) -> Result<Vec<howler_editor::Selection>, AppError> {
+        let lock = Arc::clone(&self.operation_lock);
+        let _operation = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.ensure_current_generation()?;
+        Ok(self.editor.set_selections(expected_revision, selections)?)
+    }
+
     pub fn execute_command(
         &mut self,
         expected_revision: u64,
@@ -1871,6 +1882,17 @@ pub struct CompositionCommit {
     pub original_text: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InputOrigin {
+    Typing,
+    Paste,
+    Composition,
+    Dictation,
+    Autocorrection,
+    Replacement,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HostTextEdit {
     pub expected_revision: u64,
@@ -1879,6 +1901,29 @@ pub struct HostTextEdit {
     pub history: howler_editor::HistoryHint,
     #[serde(default)]
     pub composition: Option<CompositionCommit>,
+    #[serde(default)]
+    pub input_origin: Option<InputOrigin>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostSelectionUpdate {
+    pub expected_revision: u64,
+    pub selections: Vec<howler_editor::Selection>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SelectionResult {
+    pub revision: u64,
+    pub selections: Vec<howler_editor::Selection>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionCapabilities {
+    pub application_session_abi: u32,
+    pub selection_updates: bool,
+    pub input_origin_metadata: bool,
+    pub rust_owned_history: bool,
+    pub pending_native_drafts: bool,
 }
 
 impl From<HostTextEdit> for Transaction {
@@ -2266,6 +2311,19 @@ impl ApplicationSession {
         self.applied((), Vec::new())
     }
 
+    pub fn capabilities(&self) -> ApplicationResponse<SessionCapabilities> {
+        self.applied(
+            SessionCapabilities {
+                application_session_abi: 2,
+                selection_updates: true,
+                input_origin_metadata: true,
+                rust_owned_history: true,
+                pending_native_drafts: true,
+            },
+            Vec::new(),
+        )
+    }
+
     pub fn connect(&mut self, request: ConnectFolder) -> ApplicationResponse<ConnectResult> {
         let mut effects = Vec::new();
         if let Err(problem) = self.prepare_replacement(&mut effects) {
@@ -2423,6 +2481,51 @@ impl ApplicationSession {
             Err(problem) => return self.rejected(problem, Vec::new()),
         };
         self.finish_mutation(outcome)
+    }
+
+    pub fn apply_selection(
+        &mut self,
+        update: HostSelectionUpdate,
+    ) -> ApplicationResponse<SelectionResult> {
+        let (relative_path, previous_selections, selections) = match self.active_mut() {
+            Ok(active) => {
+                let relative_path = active.editor.relative_path.clone();
+                let previous_selections = active.editor.snapshot().selections;
+                match active
+                    .editor
+                    .set_selections(update.expected_revision, update.selections)
+                {
+                    Ok(selections) => (relative_path, previous_selections, selections),
+                    Err(error) => return self.rejected(problem_from_error(error), Vec::new()),
+                }
+            }
+            Err(problem) => return self.rejected(problem, Vec::new()),
+        };
+        if let Some(head) = selections.first().map(|selection| selection.head) {
+            if let Err(error) = self
+                .folder_ref()
+                .and_then(|folder| folder.set_cursor(&relative_path, head))
+            {
+                let rollback = self.active_mut().and_then(|active| {
+                    active
+                        .editor
+                        .set_selections(update.expected_revision, previous_selections)
+                        .map_err(problem_from_error)
+                });
+                debug_assert!(
+                    rollback.is_ok(),
+                    "validated selection rollback must succeed"
+                );
+                return self.rejected(problem_from_error(error), Vec::new());
+            }
+        }
+        self.applied(
+            SelectionResult {
+                revision: update.expected_revision,
+                selections,
+            },
+            Vec::new(),
+        )
     }
 
     pub fn execute_command(
@@ -5144,6 +5247,7 @@ mod tests {
             selections: Vec::new(),
             history: howler_editor::HistoryHint::Isolated,
             composition: None,
+            input_origin: None,
         });
         let OperationOutcome::Rejected(problem) = response.outcome else {
             panic!("stale edit was applied");
@@ -5157,6 +5261,103 @@ mod tests {
             })
         ));
         assert_eq!(response.state.active.unwrap().editor.snapshot.revision, 0);
+    }
+
+    #[test]
+    fn application_session_selection_updates_cursor_without_editing_or_history() {
+        let notes = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let mut session = connect_session(&notes, &state);
+        let edited = session.apply_text_edit(HostTextEdit {
+            expected_revision: 0,
+            replacements: vec![howler_editor::Replacement {
+                range: TextRange::new(0, 0),
+                text: "a😀b".into(),
+            }],
+            selections: Vec::new(),
+            history: howler_editor::HistoryHint::Typing,
+            composition: None,
+            input_origin: Some(InputOrigin::Typing),
+        });
+        assert!(matches!(edited.outcome, OperationOutcome::Applied(_)));
+        let active = edited.state.active.unwrap();
+        let relative_path = session
+            .folder_ref()
+            .unwrap()
+            .discover()
+            .unwrap()
+            .into_iter()
+            .find(|note| note.id == active.note_id)
+            .unwrap()
+            .relative_path;
+        let reversed = Selection {
+            anchor: 5,
+            head: 1,
+            affinity: howler_editor::Affinity::Upstream,
+            revision: 1,
+        };
+
+        let response = session.apply_selection(HostSelectionUpdate {
+            expected_revision: 1,
+            selections: vec![reversed.clone()],
+        });
+        let OperationOutcome::Applied(result) = response.outcome else {
+            panic!("selection update was rejected");
+        };
+        assert_eq!(result.revision, 1);
+        assert_eq!(result.selections, vec![reversed.clone()]);
+        let snapshot = response.state.active.unwrap().editor.snapshot;
+        assert_eq!(snapshot.revision, 1);
+        assert_eq!(snapshot.source, "a😀b");
+        assert!(snapshot.can_undo);
+        assert_eq!(
+            session
+                .folder_ref()
+                .unwrap()
+                .cursor(&relative_path)
+                .unwrap(),
+            Some(1)
+        );
+
+        let invalid = session.apply_selection(HostSelectionUpdate {
+            expected_revision: 1,
+            selections: vec![Selection::caret(2, 1)],
+        });
+        assert!(matches!(
+            invalid.outcome,
+            OperationOutcome::Rejected(ApplicationProblem {
+                code: ProblemCode::InvalidOperation,
+                ..
+            })
+        ));
+        let stale = session.apply_selection(HostSelectionUpdate {
+            expected_revision: 0,
+            selections: vec![Selection::caret(0, 0)],
+        });
+        assert!(matches!(
+            stale.outcome,
+            OperationOutcome::Rejected(ApplicationProblem {
+                code: ProblemCode::StaleRevision,
+                ..
+            })
+        ));
+
+        let undone = session.undo(1);
+        assert!(matches!(undone.outcome, OperationOutcome::Applied(Some(_))));
+        assert_eq!(undone.state.active.unwrap().editor.snapshot.source, "");
+    }
+
+    #[test]
+    fn application_session_reports_required_native_host_capabilities() {
+        let session = ApplicationSession::default();
+        let OperationOutcome::Applied(capabilities) = session.capabilities().outcome else {
+            panic!("capabilities were rejected");
+        };
+        assert_eq!(capabilities.application_session_abi, 2);
+        assert!(capabilities.selection_updates);
+        assert!(capabilities.input_origin_metadata);
+        assert!(capabilities.rust_owned_history);
+        assert!(capabilities.pending_native_drafts);
     }
 
     #[test]
@@ -5200,6 +5401,7 @@ mod tests {
             selections: Vec::new(),
             history: howler_editor::HistoryHint::Typing,
             composition: None,
+            input_origin: None,
         });
         assert!(matches!(first_edit.outcome, OperationOutcome::Applied(_)));
         assert!(matches!(
@@ -5285,6 +5487,7 @@ mod tests {
             selections: Vec::new(),
             history: howler_editor::HistoryHint::Typing,
             composition: None,
+            input_origin: None,
         });
         let target = response
             .effects
@@ -5333,6 +5536,7 @@ mod tests {
             selections: Vec::new(),
             history: howler_editor::HistoryHint::Typing,
             composition: None,
+            input_origin: None,
         });
         assert_eq!(
             edited.state.active.unwrap().persistence.replacement_safety,
@@ -5364,6 +5568,7 @@ mod tests {
             selections: Vec::new(),
             history: howler_editor::HistoryHint::Typing,
             composition: None,
+            input_origin: None,
         });
         let (effect_id, target) = edited
             .effects
@@ -5472,6 +5677,7 @@ mod tests {
                 selections: Vec::new(),
                 history: howler_editor::HistoryHint::Typing,
                 composition: None,
+                input_origin: None,
             });
             let note_id = session.state().active.unwrap().note_id;
             session.preserve_pending_native_draft(PendingNativeDraft {
@@ -5524,6 +5730,7 @@ mod tests {
             selections: Vec::new(),
             history: howler_editor::HistoryHint::Typing,
             composition: None,
+            input_origin: None,
         });
         session.preserve_pending_native_draft(PendingNativeDraft {
             base_revision: 1,
@@ -5751,6 +5958,7 @@ mod tests {
             selections: Vec::new(),
             history: howler_editor::HistoryHint::Typing,
             composition: None,
+            input_origin: None,
         });
         fs::write(notes.path().join("note.md"), "external").unwrap();
         let reconciled = session.reconcile_active();
@@ -5806,6 +6014,7 @@ mod tests {
             selections: Vec::new(),
             history: howler_editor::HistoryHint::Typing,
             composition: None,
+            input_origin: None,
         });
         fs::write(notes.path().join("note.md"), "external").unwrap();
         let conflict = session
@@ -5862,6 +6071,7 @@ mod tests {
             selections: Vec::new(),
             history: howler_editor::HistoryHint::Typing,
             composition: None,
+            input_origin: None,
         });
         fs::write(notes.path().join("note.md"), "external").unwrap();
         let conflict = session

@@ -20,12 +20,14 @@ PascalCase; application enum tags are snake_case.
 | C function | Input contract | Applied `value` |
 | --- | --- | --- |
 | `howler_session_state_json` | none | `null` |
+| `howler_session_capabilities_json` | none | `sessionCapabilities` |
 | `howler_session_connect_json` | `connectRequest` | `{ "opened_note": NoteSummary|null }` |
 | `howler_session_adopt_folder_json` | none | connect result |
 | `howler_session_create_note_json` | `createNoteRequest` | `{ "note": NoteSummary }` |
 | `howler_session_open_note_json` | borrowed note-ID string | note result |
 | `howler_session_close_note_json` | none | `null` |
 | `howler_session_apply_text_edit_json` | `hostTextEdit` | editor `EditResult` |
+| `howler_session_apply_selection_json` | `hostSelectionUpdate` | `selectionResult` |
 | `howler_session_preserve_pending_native_draft_json` | `pendingNativeDraft` | `null` |
 | `howler_session_resolve_pending_native_draft_json` | `pendingDraftResolution` | note result |
 | `howler_session_execute_command_json` | expected revision argument plus editor command JSON | editor `EditResult` |
@@ -52,3 +54,8 @@ request or source is rejected.
 Editor command JSON follows Serde's externally tagged representation, for example
 `{"Bold":{"range":{"start":0,"end":4}}}`. The implemented command variants are `Bold`,
 `Emphasis`, `Link`, `UnorderedList`, and `Checkbox` as declared by `howler-editor`.
+
+Selection updates use current-revision UTF-8 coordinates and do not change the document revision,
+source, durability, or undo/redo history. Text edits may include `input_origin` with `typing`,
+`paste`, `composition`, `dictation`, `autocorrection`, or `replacement`; omission remains valid for
+existing ABI v2 callers.

@@ -1,5 +1,7 @@
 # Milestone 1 Implementation Plan: Local Notes and Search
 
+Historical host plan: ADR-0008 supersedes the SwiftUI/AppKit implementation details. Rust ownership and compatibility requirements remain applicable.
+
 Status: Draft 1  
 Source specification: `SPEC.md`  
 Outcome: A usable macOS notes app backed by the reusable Rust editor library

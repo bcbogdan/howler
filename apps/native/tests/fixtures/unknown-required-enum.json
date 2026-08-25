@@ -1,0 +1,13 @@
+{
+  "state": {
+    "folder": null,
+    "active": null,
+    "recoveries": [],
+    "background_tasks": []
+  },
+  "effects": [],
+  "outcome": {
+    "status": "rejected",
+    "value": { "code": "future_code", "diagnostic": "future", "details": null }
+  }
+}

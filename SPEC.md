@@ -158,8 +158,8 @@ The initial user is an individual who frequently takes transient notes, meeting 
 
 ```text
 +------------------+     +----------------------+     +----------------------+
-| Native macOS app |<--->| Rust app services    |<--->| User-owned note      |
-| SwiftUI + AppKit | FFI | storage/search/tasks |     | folder + attachments |
+| Native SDK host  |<--->| Rust app services    |<--->| User-owned note      |
+| Zig presentation | FFI | storage/search/tasks |     | folder + attachments |
 +--------+---------+     +-----+------------+---+     +----------------------+
          |                     |            |
          v                     v            v
@@ -187,7 +187,7 @@ howler/
     editor/             Standalone editor C ABI
     application/        Full Howler application C ABI
   apps/
-    macos/              SwiftUI shell and AppKit editor adapter
+    native/             Native SDK shell and Zig presentation layer
     cli/                Development and diagnostics CLI
   plugins/
     sdk/                Future plugin schemas and host interfaces
@@ -255,11 +255,11 @@ The editor library uses an efficient UTF-8 text structure such as a rope. The ex
 
 The Rust workspace should prefer stable Rust and minimize unsafe code. Unsafe code is isolated to reviewed FFI modules.
 
-### 7.2 macOS: SwiftUI and AppKit
+### 7.2 Native host: Native SDK and Zig
 
-SwiftUI provides the application shell and settings surfaces. AppKit TextKit and window APIs provide native glyph layout, floating panel behavior, keyboard handling, input methods, and accessibility. The AppKit editor is an adapter over the Rust editor session rather than an independent document model.
+Native SDK provides rendering, editable Markdown, window behavior, keyboard handling, input methods, and accessibility. Zig adapts Native SDK events to the Rust application session rather than maintaining an independent document model. The first target is macOS 13; Windows and Linux follow macOS parity.
 
-A browser-based editor is not planned for the first macOS app because it weakens native behavior and introduces a second application runtime. This decision can be revisited if native rich Markdown editing proves disproportionately costly.
+A browser-based editor is not planned because it weakens native behavior and introduces a second application runtime.
 
 ### 7.3 Local database: SQLite
 
@@ -267,7 +267,7 @@ SQLite stores derived indexes and device-local operational state outside the not
 
 ### 7.4 Interoperability: C ABI
 
-The editor library and full application services expose separate opaque-handle C APIs with explicit ownership and error handling. A host that only needs editing does not link storage or SQLite. Swift bindings may be generated or wrapped manually, but the C headers are the compatibility contracts.
+The editor library and full application services expose separate opaque-handle C APIs with explicit ownership and error handling. A host that only needs editing does not link storage or SQLite. Zig imports the checked-in C headers, which remain the compatibility contracts.
 
 The FFI is versioned separately from Rust crates. Asynchronous operations use callbacks or a polled event queue; they must never invoke host UI code while holding internal Rust locks.
 
@@ -495,7 +495,7 @@ Each open note has a headless Rust `EditorSession`. The session owns:
 - Editor commands such as emphasis, links, lists, and task toggles.
 - Changed ranges and domain events consumed by storage and hosts.
 
-The buffer should use an efficient text structure such as a rope and must not require copying the complete document for each keystroke. Internal ranges are UTF-8 byte offsets at valid code-point boundaries. Host adapters are responsible for explicit conversion to platform range units such as TextKit's UTF-16 `NSRange`.
+The buffer should use an efficient text structure such as a rope and must not require copying the complete document for each keystroke. Internal ranges are UTF-8 byte offsets at valid code-point boundaries. Host adapters are responsible for explicit conversion to platform range units such as macOS UTF-16 text ranges.
 
 The Markdown module provides:
 
@@ -565,7 +565,7 @@ The default is one source-preserving rich Markdown editor:
 - Copy supports plain text and Markdown; rich HTML is optional.
 - A plain-source mode is a useful fallback but not required for Milestone 1.
 
-The native editor adapter applies editor-library decorations to its text system without becoming a second source of document semantics. AppKit owns glyph layout, display attributes, the accessibility tree, accessibility ranges and actions, focus, and announcements. Rust owns which source ranges represent headings, emphasis, links, tasks, syntax markers, and other semantic constructs.
+The Native SDK editor adapter applies editor-library decorations to the platform text system without becoming a second source of document semantics. The native backend owns glyph layout, display attributes, the accessibility tree, accessibility ranges and actions, focus, and announcements. Rust owns which source ranges represent headings, emphasis, links, tasks, syntax markers, and other semantic constructs.
 
 ### 12.2 Autosave
 
@@ -650,7 +650,7 @@ App services -> Files: atomically create Markdown file
 App services -> SQLite: index note
 App services -> Editor library: create editor session
 App services -> Host: note-editor handle and initial snapshot
-Host: present source and decorations through AppKit
+Host: present source and decorations through the Native SDK text control
 Host -> App services: apply note edit(expected_revision, edits, selections)
 App services -> Editor library: apply transaction
 Editor library -> App services: accepted revision, selections, changes, decorations
@@ -894,7 +894,7 @@ Reliability requirements:
 
 ### 22.2 FFI tests
 
-- ABI header compilation from C and Swift test targets.
+- ABI header compilation from C and translation by Zig.
 - Ownership, cancellation, threading, and error-path tests.
 - Compatibility tests for supported ABI versions.
 
@@ -965,7 +965,7 @@ Compatibility promises are separate:
 | Risk | Mitigation |
 | --- | --- |
 | Native rich Markdown editing is complex | Build a source-preservation prototype first; retain a plain-source fallback |
-| Rust and TextKit document state diverge | Make Rust authoritative, use revision-checked transactions, and test range conversions |
+| Rust and native editor state diverge | Make Rust authoritative, use revision-checked transactions, and test range conversions |
 | IME conflicts with authoritative editor state | Keep marked text host-local and commit at defined composition boundaries |
 | FFI slows iteration | Keep a coarse application facade and test bindings continuously |
 | External editors create identity conflicts | Detect duplicates, avoid rewrites during indexing, provide explicit repair |
@@ -992,7 +992,7 @@ The following require prototypes or ADRs before their milestone begins:
 ## 28. Implementation Order
 
 1. Create a Rust editor spike with a rope, revision-checked transactions, selection transforms, Markdown decorations, and undo/redo.
-2. Validate the editor C ABI with a minimal TextKit host, including UTF-8/UTF-16 ranges, IME, and VoiceOver behavior.
+2. Validate the editor C ABI with the Native SDK host, including UTF-8/UTF-16 ranges, IME, and VoiceOver behavior.
 3. Add folder discovery, atomic Markdown persistence, SQLite FTS5 indexing, and index rebuilding.
 4. Implement note lifecycle, recovery journals, external-change handling, and golden note-folder tests.
 5. Build the floating macOS shell, global activation, `Cmd+N`, and `Cmd+P`.

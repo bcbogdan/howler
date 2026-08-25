@@ -92,6 +92,20 @@ pub unsafe extern "C" fn howler_session_state_json(
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn howler_session_capabilities_json(
+    session: *mut HowlerApplicationSession,
+    out_response_json: *mut *mut c_char,
+    out_boundary_problem_json: *mut *mut c_char,
+) -> i32 {
+    session_output(
+        session,
+        out_response_json,
+        out_boundary_problem_json,
+        |session| session.capabilities(),
+    )
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn howler_session_connect_json(
     session: *mut HowlerApplicationSession,
     request_json: *const c_char,
@@ -180,6 +194,22 @@ pub unsafe extern "C" fn howler_session_apply_text_edit_json(
         out_response_json,
         out_boundary_problem_json,
         ApplicationSession::apply_text_edit,
+    )
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn howler_session_apply_selection_json(
+    session: *mut HowlerApplicationSession,
+    selection_json: *const c_char,
+    out_response_json: *mut *mut c_char,
+    out_boundary_problem_json: *mut *mut c_char,
+) -> i32 {
+    session_input(
+        session,
+        selection_json,
+        out_response_json,
+        out_boundary_problem_json,
+        ApplicationSession::apply_selection,
     )
 }
 
@@ -1353,7 +1383,7 @@ mod tests {
             assert!(state_json.contains("\"state\":{"));
             howler_session_string_free(response);
             let edit = CString::new(
-                r#"{"expected_revision":8,"replacements":[],"selections":[],"history":"Isolated","composition":null}"#,
+                r#"{"expected_revision":8,"replacements":[],"selections":[],"history":"Isolated","composition":null,"input_origin":"dictation"}"#,
             )
             .unwrap();
             response = ptr::null_mut();
@@ -1416,6 +1446,83 @@ mod tests {
     }
 
     #[test]
+    fn session_abi_reports_capabilities_and_applies_selection_only_updates() {
+        let notes = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        unsafe {
+            let session = create_session();
+            connect_session(session, notes.path(), state.path());
+            let mut response = ptr::null_mut();
+            let mut boundary = ptr::null_mut();
+            assert_eq!(
+                howler_session_capabilities_json(session, &mut response, &mut boundary),
+                OK
+            );
+            assert!(boundary.is_null());
+            let capabilities: serde_json::Value =
+                serde_json::from_str(CStr::from_ptr(response).to_str().unwrap()).unwrap();
+            assert_eq!(capabilities["outcome"]["value"]["selection_updates"], true);
+            assert_eq!(
+                capabilities["outcome"]["value"]["input_origin_metadata"],
+                true
+            );
+            howler_session_string_free(response);
+
+            let selection = CString::new(
+                r#"{"expected_revision":0,"selections":[{"anchor":0,"head":0,"affinity":"Downstream","revision":0}]}"#,
+            )
+            .unwrap();
+            response = ptr::null_mut();
+            assert_eq!(
+                howler_session_apply_selection_json(
+                    session,
+                    selection.as_ptr(),
+                    &mut response,
+                    &mut boundary,
+                ),
+                OK
+            );
+            assert!(boundary.is_null());
+            let result: serde_json::Value =
+                serde_json::from_str(CStr::from_ptr(response).to_str().unwrap()).unwrap();
+            assert_eq!(result["outcome"]["status"], "applied");
+            assert_eq!(result["outcome"]["value"]["revision"], 0);
+            assert_eq!(
+                result["state"]["active"]["editor"]["snapshot"]["revision"],
+                0
+            );
+            howler_session_string_free(response);
+            howler_session_destroy(session);
+        }
+    }
+
+    #[test]
+    fn session_abi_rejects_invalid_utf8_json_input() {
+        unsafe {
+            let session = create_session();
+            let invalid = [0xff_u8, 0];
+            let mut response = 1usize as *mut c_char;
+            let mut boundary = 1usize as *mut c_char;
+            assert_eq!(
+                howler_session_apply_selection_json(
+                    session,
+                    invalid.as_ptr().cast(),
+                    &mut response,
+                    &mut boundary,
+                ),
+                INVALID_ARGUMENT
+            );
+            assert!(response.is_null());
+            assert!(CStr::from_ptr(boundary)
+                .to_str()
+                .unwrap()
+                .contains("invalid_utf8"));
+            howler_session_string_free(boundary);
+            howler_session_destroy(session);
+        }
+    }
+
+    #[test]
     fn v1_v2_versions_are_stable() {
         assert_eq!(howler_application_abi_version(), 1);
         assert_eq!(howler_session_abi_version(), 2);
@@ -1442,6 +1549,7 @@ mod tests {
             "connectRequest",
             "createNoteRequest",
             "hostTextEdit",
+            "hostSelectionUpdate",
             "editorCommand",
             "pendingNativeDraft",
             "pendingDraftResolution",
@@ -1454,6 +1562,8 @@ mod tests {
             "noteSummary",
             "noteResult",
             "editResult",
+            "selectionResult",
+            "sessionCapabilities",
             "saveResult",
             "reconcileResult",
             "searchResult",

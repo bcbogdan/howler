@@ -12,6 +12,12 @@ Replace the SwiftUI/AppKit macOS host with a Native SDK host written in Zig.
 - Keep Rust authoritative for source, revisions, history, persistence, conflicts, recovery, replacement safety, and autosave identity.
 - Keep Zig responsible for presentation, native input, windows, dialogs, timers, accessibility, and platform capabilities.
 
+## Current Status
+
+Phases 1, 3, 4, and the headless portions of Phase 5 are implemented. The native host now covers folder selection, editing, Rust-owned history, exact autosave targets, search and note opening, recovery, pending-draft resolution, and conflict resolution.
+
+The migration is not release-ready. The local Native SDK fork now wires all-Spaces/full-screen auxiliary flags through startup and runtime-created windows, but it still needs system-wide global shortcuts and a remote commit pin. macOS runtime, IME, accessibility, packaging, signing, and notarization gates remain unverified from the Linux development host.
+
 ## Target Repository Shape
 
 ```text

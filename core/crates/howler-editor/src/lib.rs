@@ -219,6 +219,26 @@ impl EditorSession {
         Ok(self.result(changed))
     }
 
+    pub fn set_selections(
+        &mut self,
+        expected_revision: u64,
+        selections: Vec<Selection>,
+    ) -> Result<Vec<Selection>, EditorError> {
+        self.check_revision(expected_revision)?;
+        let len = self.source.len_bytes();
+        if selections.iter().any(|selection| {
+            selection.revision != self.revision
+                || selection.anchor > len
+                || selection.head > len
+                || !is_boundary(&self.source, selection.anchor)
+                || !is_boundary(&self.source, selection.head)
+        }) {
+            return Err(EditorError::InvalidSelection);
+        }
+        self.selections = selections;
+        Ok(self.selections.clone())
+    }
+
     pub fn execute_command(
         &mut self,
         expected_revision: u64,
@@ -714,6 +734,50 @@ mod tests {
             history: HistoryHint::Isolated,
         });
         assert_eq!(invalid.unwrap_err(), EditorError::InvalidSelection);
+    }
+
+    #[test]
+    fn selection_updates_preserve_revision_source_and_history() {
+        let mut editor = EditorSession::new("a😀b");
+        editor
+            .apply(edit(0, 1, 1, "x", HistoryHint::Typing))
+            .unwrap();
+        let before = editor.snapshot();
+        let selections = vec![Selection {
+            anchor: 6,
+            head: 1,
+            affinity: Affinity::Upstream,
+            revision: 1,
+        }];
+
+        assert_eq!(
+            editor.set_selections(1, selections.clone()).unwrap(),
+            selections
+        );
+        let after = editor.snapshot();
+        assert_eq!(after.revision, before.revision);
+        assert_eq!(after.source, before.source);
+        assert_eq!(after.can_undo, before.can_undo);
+        assert_eq!(after.can_redo, before.can_redo);
+        assert_eq!(after.selections, selections);
+        editor.undo(1).unwrap().unwrap();
+        assert_eq!(editor.snapshot().source, "a😀b");
+    }
+
+    #[test]
+    fn selection_updates_reject_stale_revisions_and_invalid_utf8_boundaries() {
+        let mut editor = EditorSession::new("a😀b");
+        assert!(matches!(
+            editor.set_selections(1, vec![Selection::caret(0, 1)]),
+            Err(EditorError::StaleRevision { .. })
+        ));
+        assert_eq!(
+            editor
+                .set_selections(0, vec![Selection::caret(2, 0)])
+                .unwrap_err(),
+            EditorError::InvalidSelection
+        );
+        assert_eq!(editor.snapshot(), EditorSession::new("a😀b").snapshot());
     }
 
     #[test]

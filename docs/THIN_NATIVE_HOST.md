@@ -8,9 +8,9 @@ requirements rather than current safety guarantees.
 
 ## Principle
 
-Rust owns application policy and state transitions. Swift owns native mechanisms and presentation.
+Rust owns application policy and state transitions. Native SDK and Zig own native mechanisms and presentation.
 
-The macOS host must not independently coordinate folder, editor, durability, recovery, conflict, or replacement invariants. Those invariants belong in Rust, where they can be tested on every supported development platform. AppKit remains responsible for behavior that is inherently native.
+The host must not independently coordinate folder, editor, durability, recovery, conflict, or replacement invariants. Those invariants belong in Rust, where they can be tested on every supported development platform. Native SDK remains responsible for behavior that is inherently native.
 
 The boundary has two Rust layers:
 
@@ -90,7 +90,7 @@ impl ApplicationSession {
 }
 ```
 
-`ConnectFolder` includes the note-folder path, application-state path, adoption choice, and whether a missing folder may be created. Swift discovers native paths and obtains user consent; Rust validates and applies the request.
+`ConnectFolder` includes the note-folder path, application-state path, adoption choice, and whether a missing folder may be created. The Native SDK host discovers native paths and obtains user consent; Rust validates and applies the request.
 
 Long-running rescan and rebuild work is asynchronous, cancellable, and reports progress through application events. Search may remain synchronous while it meets its latency target, but it must use an immutable/index connection path that does not take an active editor's mutation lock.
 
@@ -111,7 +111,7 @@ Rust owns:
 - Durability transitions and retry state.
 - Conflict versus clean-refresh decisions.
 - Per-note mutation serialization.
-- Transaction validation, construction, and revision handling after Swift supplies native edit facts.
+- Transaction validation, construction, and revision handling after Zig supplies native edit facts.
 - The authoritative state returned after each operation.
 
 ## Operation Responses
@@ -181,7 +181,7 @@ pub enum ProblemDetails {
 }
 ```
 
-`ProblemCode` is stable and machine-readable. `diagnostic` is for logs and fallback presentation, not policy or localization. Swift chooses localized presentation from the code and structured details. Each code defines which detail variant is required; schema tests reject a missing or mismatched required detail. New optional fields may be ignored, while new codes or detail variants require an ABI schema version understood by the host.
+`ProblemCode` is stable and machine-readable. `diagnostic` is for logs and fallback presentation, not policy or localization. Zig chooses localized presentation from the code and structured details. Each code defines which detail variant is required; schema tests reject a missing or mismatched required detail. New optional fields may be ignored, while new codes or detail variants require an ABI schema version understood by the host.
 
 Current `AppError` and `EditorError` cases map once at the application boundary. Missing notes and recoveries, pending recovery, stale revision, external conflict, identity or generation changes, ownership, destination, duplicate identity, input/domain validation, persistence, content-hash, adoption, and database failures map to their corresponding codes above. The mapping must not discard fields needed for retry or conflict resolution.
 
@@ -206,7 +206,7 @@ Failures that happen before a usable session can be identified, such as a null h
 
 ## Authoritative State
 
-State returned to Swift contains everything needed to render the active editor coherently:
+State returned to Zig contains everything needed to render the active editor coherently:
 
 ```rust
 pub struct ApplicationState {
@@ -266,7 +266,7 @@ Rust derives replacement safety from the complete persistence state. In particul
 
 ## Native Edit Contract
 
-Swift reports native input facts; Rust constructs and applies the application transaction:
+The Zig Native SDK host reports native input facts; Rust constructs and applies the application transaction:
 
 ```rust
 pub struct HostTextEdit {
@@ -285,18 +285,18 @@ pub struct CompositionCommit {
 
 Replacement ranges use the source at `expected_revision`. Supplied selections use post-edit UTF-8 coordinates and carry `expected_revision + 1`; Rust validates them against the resulting source. An empty selection list asks Rust to transform the previous selections. Selections preserve anchor, head, affinity, and revision. The initial macOS host may expose one selection, but it must not collapse a reversed selection to its upper bound.
 
-Swift retains a committed IME payload after a stale-revision rejection. It refreshes from the returned state and replays only when `original_range` still contains `original_text`; carrying the text avoids a cross-language hash contract. Rust never reads TextKit marked-text state directly.
+The host retains a committed IME payload after a stale-revision rejection. It refreshes from the returned state and replays only when `original_range` still contains `original_text`; carrying the text avoids a cross-language hash contract. Rust never reads platform marked-text state directly.
 
-`BUSY` is transport backpressure, not rejection of committed input. Swift queues the exact edit or composition payload together with its pre-edit snapshot and retries it before accepting another native transaction based on that Rust revision. A `BUSY` result never causes TextKit input to be discarded or treated as acknowledged.
+`BUSY` is transport backpressure, not rejection of committed input. The host queues the exact edit or composition payload together with its pre-edit snapshot and retries it before accepting another native transaction based on that Rust revision. A `BUSY` result never causes native input to be discarded or treated as acknowledged.
 
-If the retry becomes stale, Swift refreshes authoritative state and replays only when each original range, replaced text, and adjacent context still identify the same edit location. Otherwise Swift submits the resulting native source and base revision through `preserve_pending_native_draft` and retains its local copy until Rust acknowledges durable recovery. Rust then exposes the pending draft in `ApplicationState`, sets replacement safety, and offers explicit merge/save-as-new or discard resolution. This guarded stale-rebase protocol applies to ordinary committed input as well as IME commits; unreplayable input never remains solely in presentation state.
+If the retry becomes stale, the host refreshes authoritative state and replays only when each original range, replaced text, and adjacent context still identify the same edit location. Otherwise it submits the resulting native source and base revision through `preserve_pending_native_draft` and retains its local copy until Rust acknowledges durable recovery. Rust then exposes the pending draft in `ApplicationState`, sets replacement safety, and offers explicit save-as-new or discard resolution. This guarded stale-rebase protocol applies to ordinary committed input as well as IME commits; unreplayable input never remains solely in presentation state.
 
-## Swift Responsibilities
+## Native Host Responsibilities
 
-Keep inherently native behavior in Swift and AppKit:
+Keep inherently native behavior in the Zig Native SDK host and its platform backend:
 
-- `NSTextView` rendering and attributed decorations.
-- UTF-16 `NSRange` to UTF-8 range conversion.
+- Native text rendering and attributed decorations.
+- Platform text-range to UTF-8 range conversion.
 - Caret, selection, scrolling, and focus.
 - IME marked-text composition and safe replay of a rejected commit.
 - VoiceOver and accessibility actions.
@@ -305,12 +305,12 @@ Keep inherently native behavior in Swift and AppKit:
 - Folder selection and Application Support path discovery.
 - Native file watching, provider permission prompts, and platform file coordination.
 - Local notification scheduling and delivery.
-- SwiftUI presentation and localized messages.
+- Native SDK presentation and localized messages.
 - Timers and other platform effects requested by Rust.
 
-Swift decides how a problem is presented. Rust decides what the problem means, which state transition occurred, and whether replacing the current editor is safe.
+The host decides how a problem is presented. Rust decides what the problem means, which state transition occurred, and whether replacing the current editor is safe.
 
-Palette visibility, query text, focus, and localized strings remain presentation state. Search results are operation data consumed by the palette. Durability, conflict, current-editor invariants, and replacement safety do not remain in Swift.
+Palette visibility, query text, focus, and localized strings remain presentation state. Search results are operation data consumed by the palette. Durability, conflict, current-editor invariants, and replacement safety do not remain in Zig.
 
 ## Update And Effect Flow
 
@@ -341,60 +341,45 @@ pub struct SaveTarget {
 }
 ```
 
-When a timer fires, Swift calls `save(target)`. Rust rejects a target whose identity, revision, or generation is no longer current. Opening, closing, or connecting increments the generation and cancels superseded effects.
+When a timer fires, Zig calls `save(target)`. Rust rejects a target whose identity, revision, or generation is no longer current. Opening, closing, or connecting increments the generation and cancels superseded effects.
 
-Notification effects contain stable intent IDs. Swift reports the result of every scheduling or cancellation attempt, allowing Rust to retain retry state and diagnostics rather than assuming a native effect succeeded.
+Notification effects contain stable intent IDs. The host reports the result of every scheduling or cancellation attempt, allowing Rust to retain retry state and diagnostics rather than assuming a native effect succeeded.
 
 Platform file coordination is a synchronous native capability injected into `ApplicationServices`, not a post-operation effect. On provider-managed macOS locations, the capability enters a Rust commit continuation inside the native coordination accessor. The continuation performs the coordinated re-read, second hash validation, atomic replacement, and parent synchronization. The callback runs on the calling operation's executor and must not reenter an application-session ABI function. Other platforms provide their strongest equivalent advisory mechanism or an explicitly unsupported implementation.
 
 The editing flow becomes:
 
 ```text
-TextKit commits native input
-  -> Swift converts ranges and selections to UTF-8
+Native text control commits input
+  -> Zig converts ranges and selections to UTF-8
   -> ApplicationSession routes the edit through the note executor
   -> Rust accepts the transaction and persists or schedules recovery
   -> Rust returns authoritative state, operation data, and identified effects
-  -> Swift updates attributes and only replaces native text when it differs
-  -> Swift executes the effects
+  -> Zig updates attributes and only replaces native text when it differs
+  -> Zig executes the effects
 ```
 
-Swift must not call `apply`, separately request a snapshot, then derive durability or replacement policy itself.
+The host must not call `apply`, separately request a snapshot, then derive durability or replacement policy itself.
 
-## Thin AppModel
+## Thin Presentation Model
 
-The final Swift model primarily consumes responses and executes native effects:
+The Zig model primarily consumes responses and executes native effects. Its shape is intentionally small:
 
-```swift
-@MainActor
-final class AppModel: ObservableObject {
-    @Published var state = ApplicationState.empty
-    @Published var palettePresented = false
-    @Published var paletteQuery = ""
-    @Published var searchResults: [SearchResult] = []
+```zig
+pub const AppModel = struct {
+    state: ApplicationState,
+    palette_open: bool = false,
+    palette_query: []const u8 = "",
 
-    private let session: ApplicationSessionProtocol
-    private let effects: EffectScheduler
-
-    func apply(_ edit: NativeTextEdit) {
-        consume(session.applyTextEdit(edit))
+    pub fn consume(self: *AppModel, response: ApplicationResponse) void {
+        self.state = response.state;
+        self.effects.perform(response.effects);
+        if (response.problem) |problem| self.present(problem);
     }
-
-    private func consume<Value>(_ response: ApplicationResponse<Value>) {
-        state = response.state
-        effects.perform(response.effects)
-
-        switch response.outcome {
-        case .applied:
-            break
-        case .rejected(let problem):
-            present(problem)
-        }
-    }
-}
+};
 ```
 
-The Swift decoding layer uses explicit `Codable` enums for known Rust values. It must preserve or safely reject unknown required values according to the ABI schema contract; importing a C header alone does not type JSON fields.
+The Zig decoding layer uses explicit enums and tagged unions for known Rust values. It must preserve or safely reject unknown required values according to the ABI schema contract; importing a C header alone does not type JSON fields.
 
 ## C ABI
 
@@ -452,13 +437,13 @@ int32_t howler_session_save_json(
 void howler_session_string_free(char *string);
 ```
 
-Every session operation has an explicit C function even though complex values use JSON. This provides operation-specific documentation, Swift discoverability, and small test surfaces without a generic dispatcher.
+Every session operation has an explicit C function even though complex values use JSON. This provides operation-specific documentation, typed Zig declarations, and small test surfaces without a generic dispatcher.
 
 The capability table and its context remain valid until session destruction. `struct_size` permits compatible optional additions. After coordination is established, `coordinate_write` invokes the supplied Rust operation exactly once inside the native coordination accessor and returns its status. If coordination cannot be established, it invokes the operation zero times and returns the distinct coordination-unavailable status. It must never invoke the operation more than once, retain the operation context, or reenter a session function. A null callback also means platform coordination is unavailable, which Rust may accept for ordinary local folders but rejects when the selected location requires provider coordination.
 
 For a valid call on a locked session, `out_response_json` contains `ApplicationResponse`, including rejected domain operations. `out_boundary_problem_json` is reserved for failures where coherent session state cannot be returned. Both output pointers are initialized to null before other validation. The ABI defines nullability, status categories, string ownership, handle destruction synchronization, and non-blocking `BUSY` behavior.
 
-Import the C header through a SwiftPM C target or module map instead of manually redeclaring symbols with `@_silgen_name`. Clang then verifies the C call contract. JSON schemas and Swift `Codable` types remain a separate, versioned contract with unknown-field tests.
+Translate the checked-in C header with Zig rather than manually redeclaring symbols. The C compiler and Zig then verify the call contract. JSON schemas and Zig response types remain a separate, versioned contract with unknown-field tests.
 
 The C handle lock protects session state only. `ApplicationServices` releases it before long-running work and uses per-note executors and background task handles. No rescan or rebuild runs synchronously while holding the session lock.
 
@@ -520,12 +505,12 @@ Test:
 - Applied and rejected response contracts.
 - Unknown optional fields and incompatible required enum values.
 - Structured stale-revision and conflict details.
-- C header compilation and Swift module import.
+- C header compilation and Zig translation.
 - ABI v1 and v2 symbol coexistence during migration.
 
-### Swift Tests
+### Native Host Tests
 
-Use a fake `ApplicationSessionProtocol` as the seam for `AppModel`. Do not mock every C function independently.
+Use fixture responses and the real ABI integration seam for the Zig model. Do not mock every C function independently.
 
 Test native boundaries:
 
@@ -533,13 +518,13 @@ Test native boundaries:
 - Forward and reversed selections.
 - IME commit, cancellation, stale-revision refresh, and guarded replay.
 - Queued retry of committed input after `BUSY`, including durable handoff when stale replay is unsafe.
-- Revision-matched decoration-to-TextKit attribute mapping.
+- Revision-matched decoration-to-native-text attribute mapping.
 - VoiceOver semantics and actions.
 - Editor focus after `Cmd+N`.
 - Keyboard-only palette navigation.
 - Panel show, hide, move, resize, and pin behavior.
 - Identified effect scheduling, cancellation, and stale timer firing.
-- Rust response decoding, unknown values, and memory ownership.
+- Rust response decoding, unknown values, and C response memory ownership.
 - Localized presentation of structured problems without policy string comparisons.
 
 Keep a small integrated macOS suite for create/edit/reopen, forced-termination recovery, external refresh and conflict resolution, VoiceOver smoke testing, and global panel activation.
@@ -558,9 +543,9 @@ Keep a small integrated macOS suite for create/edit/reopen, forced-termination r
 10. Add the host capability table and coordinated-commit continuation before moving canonical save calls to ABI v2.
 11. Move rescan and rebuild to cancellable application tasks and event polling.
 12. Expose explicit session operations through ABI v2 while retaining ABI v1 during migration.
-13. Import the C header as a Swift module and add versioned Swift response types with unknown-value handling.
-14. Reduce `AppModel` to response consumption, presentation state, queued input retry, and native effects.
+13. Translate the C header in Zig and add versioned response types with unknown-value handling.
+14. Keep the Zig model limited to response consumption, presentation state, queued input retry, and native effects.
 15. Remove superseded ABI v1 operations only when compatibility policy and known consumers permit it.
-16. Complete TextKit decoration, accessibility, focus, selection, and IME tests.
+16. Complete native text decoration, accessibility, focus, selection, and IME tests.
 
-This boundary keeps correctness and data-safety workflows testable through Rust on Linux and macOS, preserves per-note concurrency for future application features, and reserves the smaller set of genuinely AppKit-specific acceptance tests for macOS.
+This boundary keeps correctness and data-safety workflows testable through Rust on Linux and macOS, preserves per-note concurrency for future application features, and reserves the smaller set of genuinely platform-specific acceptance tests for macOS.

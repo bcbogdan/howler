@@ -1,5 +1,7 @@
 # Milestone 2 Implementation Plan: Structured Tasks
 
+Historical host plan: ADR-0008 supersedes the SwiftUI/AppKit implementation details. Rust ownership and product requirements remain applicable.
+
 Status: Draft 1  
 Source specification: `SPEC.md`  
 Dependency: Milestone 1 acceptance criteria pass

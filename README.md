@@ -6,7 +6,7 @@ Milestone 1 local-first Markdown editor and note-folder services.
 
 - Stable Rust 1.80 or newer
 - A C compiler for ABI header smoke checks
-- macOS 13 and Xcode/Swift 5.10 for the native app
+- Zig 0.16.0 and macOS 13 for the native app
 
 ## Rust
 
@@ -45,6 +45,6 @@ V2 calls are currently synchronous, hold the non-blocking session lock for the f
 
 The public v2 JSON operation matrix is `docs/APPLICATION_SESSION_V2_JSON.md`; common state, response, problem, effect, and request structures are checked in at `docs/schema/application-session-v2.schema.json`.
 
-## macOS
+## Native app
 
-Build the launchable app bundle with `apps/macos/build-app.sh`, then open it with `open apps/macos/.build/HowlerMac.app`. Pass `release` to the script for a release build. The script builds the matching Rust static library with the app's macOS 13 deployment target, builds the Swift executable, assembles the bundle, and applies an ad-hoc signature. Run tests with `swift test --package-path apps/macos`. These commands produce the current host architecture; universal or XCFramework distribution is not currently claimed. SwiftPM cannot run Cargo as a package build step; `Package.swift` selects the debug or release archive by Swift configuration. No dynamic library needs to be embedded. The Swift package contains the floating AppKit panel, SwiftUI shell, application-session FFI wrapper, TextKit adapter, range/JSON-contract tests, global shortcut, file-backed create/edit/save, recovery chooser, and search palette. External-change polling currently reconciles only the active note; full-folder rescan/rebuild remains unavailable through session ABI v2.
+The Native SDK migration host is under `apps/native`. Build the Rust application ABI with `cargo build -p howler-application-ffi`, then run `zig build` or `zig build test` from `apps/native` using Zig 0.16.0. The SDK dependency temporarily points at the local fork checkout until commit `e6a9b595` is pushed to an accessible remote; after that it must be replaced by an exact URL and package hash. macOS packaging and runtime acceptance remain migration gates.

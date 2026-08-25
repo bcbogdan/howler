@@ -1,0 +1,40 @@
+{
+    "$schema": "https://schema.native-sdk.dev/app/v1.json",
+    "id": "app.howler.mac",
+    "name": "howler",
+    "display_name": "Howler",
+    "description": "A local-first Markdown editor for user-owned note folders.",
+    "version": "0.1.0",
+    "icons": ["assets/icon.png"],
+    "platforms": ["macos"],
+    "permissions": ["view", "command", "dialog"],
+    "capabilities": ["native_views", "gpu_surfaces"],
+    "shell": {
+        "windows": [
+            {
+                "label": "main",
+                "title": "Howler",
+                "width": 920,
+                "height": 680,
+                "min_width": 640,
+                "min_height": 460,
+                "titlebar": "hidden_inset_tall",
+                "always_on_top": true,
+                "can_join_all_spaces": true,
+                "full_screen_auxiliary": true,
+                "close_policy": "event",
+                "views": [
+                    { "label": "main-canvas", "kind": "gpu_surface", "fill": true, "role": "Howler editor", "accessibility_label": "Howler", "gpu_backend": "metal", "gpu_pixel_format": "bgra8_unorm", "gpu_present_mode": "timer", "gpu_alpha_mode": "opaque", "gpu_color_space": "srgb", "gpu_vsync": true }
+                ]
+            }
+        ]
+    },
+    "security": {
+        "navigation": {
+            "allowed_origins": ["zero://app", "zero://inline"],
+            "external_links": { "action": "deny" }
+        }
+    },
+    "web_engine": "system",
+    "cef": { "dir": "third_party/cef/macos", "auto_install": false }
+}

@@ -1,0 +1,88 @@
+<column background="background">
+  <row height="52" padding="12" gap="8" cross="center" background="surface" window-drag="true" label="Howler titlebar">
+    <text grow="1" wrap="false">{folderLabel}</text>
+    <button size="sm" variant="ghost" icon="search" label="Search notes" on-press="toggle_palette"></button>
+    <button size="sm" variant="ghost" icon="plus" label="New note" on-press="create_note"></button>
+    <button size="sm" variant="ghost" icon="save" label="Save" disabled="{saveDisabled}" on-press="save"></button>
+  </row>
+  <separator />
+
+  <stack grow="1">
+    <if test="{pending_draft}">
+      <card width="560" label="Pending native draft">
+        <column gap="10">
+          <text>A committed local draft needs an explicit resolution.</text>
+          <row gap="8">
+            <button variant="primary" on-press="save_pending_draft_as_new">Save as new note</button>
+            <button variant="destructive" on-press="discard_pending_draft">Discard draft</button>
+          </row>
+        </column>
+      </card>
+    </if>
+    <if test="{conflict_visible}">
+      <card width="560" label="External conflict">
+        <column gap="10">
+          <text>The note changed outside Howler.</text>
+          <row gap="8">
+            <button variant="primary" on-press="keep_conflict_as_new">Keep local as new note</button>
+            <button variant="secondary" on-press="use_external_conflict">Use external version</button>
+          </row>
+        </column>
+      </card>
+    </if>
+    <if test="{hasRecoveries}">
+      <card width="560" label="Recovery available">
+        <column gap="10">
+          <text>Recovery available for {recoveryLabel}</text>
+          <row gap="8">
+            <button variant="primary" on-press="restore_recovery">Restore</button>
+            <button variant="destructive" on-press="discard_recovery">Discard</button>
+          </row>
+        </column>
+      </card>
+    </if>
+    <if test="{connected}">
+      <column grow="1">
+        <if test="{hasEditor}">
+          <code source="{editorSource}" language="markdown" editable="{editorEditable}" revision="{editorRevision}" selection-anchor="{selectionAnchor}" selection-focus="{selectionFocus}" external-history="true" on-editor-event="editor_event" wrap="true" grow="1" label="Markdown editor" />
+        </if>
+        <else>
+          <column grow="1" main="center" cross="center" gap="12" padding="32">
+            <text>No note is open</text>
+            <button variant="primary" on-press="create_note">Create note</button>
+          </column>
+        </else>
+      </column>
+    </if>
+    <else>
+      <column grow="1" main="center" cross="center" gap="14" padding="48">
+        <text size="heading">Your notes stay yours.</text>
+        <text foreground="text_muted">Choose a folder of Markdown files to begin.</text>
+        <button variant="primary" on-press="choose_folder">Choose notes folder</button>
+      </column>
+    </else>
+
+    <if test="{palette_visible}">
+      <card width="520" label="Search palette">
+        <column gap="10">
+          <text-field text="{queryText}" placeholder="Search notes" on-input="edit_query" autofocus="true" label="Search notes" />
+          <scroll height="320">
+            <column gap="3">
+              <for each="searchResults" key="index" as="result">
+                <list-item on-press="open_search_result:{result.index}" label="{result.title}" padding="10">
+                  <column gap="3">
+                    <text>{result.title}</text>
+                    <text size="sm" foreground="text_muted" wrap="false">{result.snippet}</text>
+                  </column>
+                </list-item>
+              </for>
+            </column>
+          </scroll>
+          <button size="sm" variant="ghost" on-press="dismiss">Close</button>
+        </column>
+      </card>
+    </if>
+  </stack>
+
+  <status-bar>{status}</status-bar>
+</column>
